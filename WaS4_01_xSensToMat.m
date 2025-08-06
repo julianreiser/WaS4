@@ -19,7 +19,7 @@ clear; clc; close all;
 dataPath = '/Volumes/ergo/rohdaten/RohDaten_GRAIL/WaS4/DATA/';  % Main data directory (raw data)
 
 % Processing options
-processAllSubjects = false;  % Set to false to process specific subjects
+processAllSubjects = true;  % Set to false to process specific subjects
 specificSubjects = [1];     % Only used if processAllSubjects = false
 overwriteExisting = false;   % Set to true to reprocess existing .mat files
 
