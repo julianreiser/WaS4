@@ -1,112 +1,146 @@
-%% EEG CONTINUOUS DATA ADDITION PIPELINE - Step 2
-% Adds Faros ECG/ACC, Center of Mass, and Pupil Labs IMU data as continuous channels
-% Run this after WaS4_00_pupilMerge.m
+%% ADDITIONAL DATA MERGING SCRIPT - WaS4 Study
+% Merges additional data sources into aligned EEG files
+% Run this script AFTER WaS4_00_pupilMerge.m and WaS4_01_xSensToMat.m
 %
 % This script:
-% 1. Loads aligned EEG data from step 1
-% 2. Loads Faros ECG/ACC data from EDF files
-% 3. Loads Xsens Center of Mass data from MAT files
-% 4. Loads Pupil Labs IMU data from IMU.csv files
-% 5. Aligns all data to EEG sampling times using existing time mapping
-% 6. Adds data as continuous channels to EEG structure
-% 7. Saves enhanced EEG files
+% 1. Loads aligned EEG files created by WaS4_00_pupilMerge.m
+% 2. Loads converted XSens data from WaS4_01_xSensToMat.m
+% 3. Loads ECG data from .EDF files (Faros device)
+% 4. Loads Pupil Labs IMU data from .csv files
+% 5. Performs time alignment using cross-correlation and counter matching
+% 6. Merges all additional data into the EEG structure
+% 7. Saves enhanced EEG files with all data sources integrated
+%
+% DEPENDENCIES: WaS4_00_pupilMerge.m, WaS4_01_xSensToMat.m
 
 clear; clc; close all;
 
-% Paths
-alignedDataPath = '/Volumes/Work4TB/Seafile/WaS4/data/aligned/';  % Input: aligned data from step 1
-outputPath = '/Volumes/Work4TB/Seafile/WaS4/data/continuous/';    % Output: EEG with continuous data
-rawDataPath = '/Volumes/ergo/rohdaten/RohDaten_GRAIL/WaS4/DATA/';  % Raw data for Faros/Xsens
+%% ==================== CONFIGURATION ====================
+
+% Data paths - should match previous scripts
+dataPath = '/Volumes/ergo/rohdaten/RohDaten_GRAIL/WaS4/DATA/';  % Raw data directory
+alignedPath = '/Volumes/Work4TB/Seafile/WaS4/data/aligned/';    % Aligned data directory (from WaS4_00)
+outPath = '/Volumes/Work4TB/Seafile/WaS4/data/merged/';    % Aligned data directory (from WaS4_00)
 
 % Processing options
-processAllSubjects = false;  % Set to false to process specific subjects
-specificSubjects = [46];  % Only used if processAllSubjects = false
-overwriteExisting = false;  % Set to true to reprocess existing files
+processAllSubjects = true;  % Set to false to process specific subjects
+specificSubjects = [1];     % Only used if processAllSubjects = false
+overwriteExisting = false;   % Set to true to reprocess existing files
 
-% Interpolation and quality options
-interpolationMethod = 'cubic';  % Method for interpolating continuous data
-maxTimeGap = 1.0;              % Max gap (seconds) to interpolate across
-minDataCoverage = 0.1;         % Minimum data coverage (10%) to add channel
+% Data integration options
+includeXSensCoM = true;      % Include XSens Center of Mass data
+includeECG = true;           % Include ECG data from .EDF files
+includePupilIMU = true;      % Include Pupil Labs IMU data
+includeXSensFootPos = true;  % Include foot position for step detection
+
+% Quality control
+maxTimeOffset = 5.0;         % Maximum allowed time offset in seconds
+minCorrelation = 0.3;        % Minimum cross-correlation for ECG alignment
 
 % Output options
+verboseOutput = true;
 saveResults = true;
 createPlots = true;
 savePlots = true;
-verboseOutput = true;
 
 %% ==================== INITIALIZATION ====================
 
 if verboseOutput
     fprintf('==========================================================\n');
-    fprintf('EEG CONTINUOUS DATA ADDITION PIPELINE - Step 2\n');
+    fprintf('ADDITIONAL DATA MERGING SCRIPT - WaS4 Study\n');
     fprintf('==========================================================\n\n');
-    fprintf('📁 Aligned data path: %s\n', alignedDataPath);
-    fprintf('💾 Output path: %s\n', outputPath);
-    fprintf('📂 Raw data path: %s\n\n', rawDataPath);
+    fprintf('📁 Raw data path: %s\n', dataPath);
+    fprintf('📁 Aligned data path: %s\n', alignedPath);
+    fprintf('📁 Merged data path: %s\n', outPath);
+    fprintf('🔧 Data sources to merge:\n');
+    if includeXSensCoM, fprintf('   ✓ XSens Center of Mass\n'); end
+    if includeECG, fprintf('   ✓ ECG (.EDF files)\n'); end
+    if includePupilIMU, fprintf('   ✓ Pupil Labs IMU\n'); end
+    if includeXSensFootPos, fprintf('   ✓ XSens Foot Position\n'); end
+    fprintf('\n');
 end
 
-% Create output directory
-if ~exist(outputPath, 'dir')
-    mkdir(outputPath);
-    if verboseOutput, fprintf('📁 Created output directory: %s\n\n', outputPath); end
+% Check directories
+if ~exist(dataPath, 'dir')
+    error('Raw data directory not found: %s', dataPath);
+end
+if ~exist(alignedPath, 'dir')
+    error('Aligned data directory not found: %s (run WaS4_00_pupilMerge.m first)', alignedPath);
+end
+if ~exist(outPath, 'dir')
+    error('Aligned data directory not found: %s', outPath);
 end
 
 % Find aligned EEG files
-alignedFiles = dir(fullfile(alignedDataPath, '*_aligned.set'));
+alignedFiles = dir(fullfile(alignedPath, '*_aligned.set'));
 if isempty(alignedFiles)
-    error('No aligned EEG files found in %s', alignedDataPath);
+    error('No aligned EEG files found in %s (run WaS4_00_pupilMerge.m first)', alignedPath);
+end
+
+% Extract subject list from aligned files
+subjectList = {};
+for i = 1:length(alignedFiles)
+    filename = alignedFiles(i).name;
+    subjectMatch = regexp(filename, '(WaS_\d+)_aligned\.set', 'tokens', 'once');
+    if ~isempty(subjectMatch)
+        subjectList{end+1} = subjectMatch{1};
+    end
 end
 
 % Filter subjects if not processing all
 if ~processAllSubjects
-    validFiles = {};
+    validSubjects = {};
     for s = 1:length(specificSubjects)
         subjectNum = specificSubjects(s);
-        pattern = sprintf('WaS_%03d', subjectNum);
-        for f = 1:length(alignedFiles)
-            if contains(alignedFiles(f).name, pattern)
-                validFiles{end+1} = alignedFiles(f).name;
-                break;
-            end
+        folderPattern = sprintf('WaS_%03d', subjectNum);
+        matchIdx = find(contains(subjectList, folderPattern));
+        if ~isempty(matchIdx)
+            validSubjects{end+1} = subjectList{matchIdx(1)};
+        else
+            warning('Subject %03d not found in aligned data', subjectNum);
         end
     end
-    if isempty(validFiles)
-        error('No aligned files found for specified subjects');
-    end
-    subjectList = validFiles;
-else
-    subjectList = {alignedFiles.name};
+    subjectList = validSubjects;
 end
 
 if verboseOutput
     fprintf('🎯 Processing %d subjects:\n', length(subjectList));
     for i = 1:length(subjectList)
-        fprintf('   - %s\n', strrep(subjectList{i}, '_aligned.set', ''));
+        fprintf('   - %s\n', subjectList{i});
     end
     fprintf('\n');
 end
 
-% Initialize tracking
+% Initialize tracking variables
 processedSubjects = {};
 failedSubjects = {};
 skippedSubjects = {};
-channelStats = [];
+mergeStats = [];
 
 %% ==================== MAIN PROCESSING LOOP ====================
 
 for s = 1:length(subjectList)
-    alignedFile = subjectList{s};
-    subjectFolder = strrep(alignedFile, '_aligned.set', '');
+    subjectFolder = subjectList{s};
+    subjectPath = fullfile(dataPath, subjectFolder);
+    
+    % Extract subject number for file matching
+    subjectNumStr = regexp(subjectFolder, 'WaS_(\d+)', 'tokens', 'once');
+    if isempty(subjectNumStr)
+        warning('Could not extract subject number from: %s', subjectFolder);
+        failedSubjects{end+1} = sprintf('%s: Could not extract subject number', subjectFolder);
+        continue;
+    end
+    subjectNum = str2double(subjectNumStr{1});
     
     if verboseOutput
         fprintf('==========================================================\n');
-        fprintf('🔄 PROCESSING: %s (%d/%d)\n', subjectFolder, s, length(subjectList));
+        fprintf('🔄 MERGING ADDITIONAL DATA: %s (Subject %d) [%d/%d]\n', subjectFolder, subjectNum, s, length(subjectList));
         fprintf('==========================================================\n\n');
     end
     
     try
         % Check if already processed
-        outputFile = fullfile(outputPath, sprintf('%s_continuous.set', subjectFolder));
+        outputFile = fullfile(outPath, sprintf('%s_merged.set', subjectFolder));
         if exist(outputFile, 'file') && ~overwriteExisting
             if verboseOutput
                 fprintf('⏭️  Already processed (use overwriteExisting=true to reprocess)\n\n');
@@ -115,676 +149,535 @@ for s = 1:length(subjectList)
             continue;
         end
         
-        %% Step 1: Load aligned EEG data and time mapping
+        %% Step 1: Load aligned EEG data
         if verboseOutput, fprintf('🧠 Loading aligned EEG data...\n'); end
         
-        eegPath = fullfile(alignedDataPath, alignedFile);
-        eeg = pop_loadset(eegPath);
-        
-        % Load alignment data for time mapping
-        alignmentDataFile = fullfile(alignedDataPath, sprintf('%s_alignment_data.mat', subjectFolder));
-        if ~exist(alignmentDataFile, 'file')
-            error('Alignment data file not found: %s', alignmentDataFile);
+        alignedFile = fullfile(alignedPath, sprintf('%s_aligned.set', subjectFolder));
+        if ~exist(alignedFile, 'file')
+            error('Aligned EEG file not found: %s', alignedFile);
         end
         
-        alignmentData = load(alignmentDataFile);
-        timeMapping = alignmentData.alignmentData.alignmentReport;
+        eeg = pop_loadset('filename', sprintf('%s_aligned.set', subjectFolder), 'filepath', alignedPath);
         
-        % Create time conversion function (CSV nanoseconds to XDF seconds)
-        csv_to_xdf_time = @(csv_time_ns) timeMapping.intercept + timeMapping.slope * (csv_time_ns * 1e-9);
-        
-        if verboseOutput
-            fprintf('   ✅ EEG loaded: %d channels, %d samples, %.1f Hz\n', ...
-                   eeg.nbchan, eeg.pnts, eeg.srate);
-            fprintf('   ✅ Time mapping loaded: slope=%.9f, intercept=%.6f\n\n', ...
-                   timeMapping.slope, timeMapping.intercept);
-        end
-        
-        %% Step 2: Create EEG time vector in XDF time
-        if verboseOutput, fprintf('⏱️  Creating EEG time vector...\n'); end
-        
-        % Find counter channel and create time vector
+        % Find counter channel
         cntIdx = find(strcmp({eeg.chanlocs.labels}, 'CNT'));
         if isempty(cntIdx)
-            error('No CNT (counter) channel found in EEG data');
+            error('No CNT (counter) channel found in aligned EEG data');
         end
-        
-        % Get original streams to find counter mapping
-        streams = alignmentData.alignmentData.originalStreams;
-        eegStreamIdx = [];
-        for i = 1:length(streams)
-            if contains(streams{i}.info.name, {'Counter', 'Sync', 'PROX'}, 'IgnoreCase', true)
-                eegStreamIdx = i;
-                break;
-            end
-        end
-        
-        if isempty(eegStreamIdx)
-            error('Could not find EEG counter stream in alignment data');
-        end
-        
-        % Match counter values between EEG and XDF to get time mapping
-        [~, idxAmp, idxLSL] = intersect(eeg.data(cntIdx,:), streams{eegStreamIdx}.time_series);
-        if length(idxAmp) < 10
-            error('Too few matching counter values (%d) for reliable time mapping', length(idxAmp));
-        end
-        
-        eegTimesXdf = NaN(1, eeg.pnts);
-        eegTimesXdf(idxAmp) = streams{eegStreamIdx}.time_stamps(idxLSL);
-        
-        % Interpolate for missing time points
-        validIdx = ~isnan(eegTimesXdf);
-        eegTimesXdf = interp1(find(validIdx), eegTimesXdf(validIdx), 1:eeg.pnts, 'linear', 'extrap');
-        
-        eegTimeStart = min(eegTimesXdf);
-        eegTimeEnd = max(eegTimesXdf);
         
         if verboseOutput
-            fprintf('   ✅ EEG time mapping: %.3f - %.3f seconds (%.1f min)\n', ...
-                   eegTimeStart, eegTimeEnd, (eegTimeEnd - eegTimeStart)/60);
-            fprintf('   📊 Counter matches: %d/%d samples (%.1f%%)\n\n', ...
-                   length(idxAmp), eeg.pnts, length(idxAmp)/eeg.pnts*100);
+            fprintf('   ✅ Loaded aligned EEG: %d channels, %d samples, %.1f Hz\n', ...
+                   eeg.nbchan, eeg.pnts, eeg.srate);
         end
         
-        %% Step 3: Load and process Faros data
-        if verboseOutput, fprintf('❤️  Loading Faros ECG/ACC data...\n'); end
+        % Track statistics
+        stats = struct();
+        stats.subject = subjectFolder;
+        stats.original_channels = eeg.nbchan;
+        stats.channels_added = 0;
+        stats.data_sources_merged = {};
+        startTime = tic;
         
-        subjectRawPath = fullfile(rawDataPath, subjectFolder);
-        farosFiles = dir(fullfile(subjectRawPath, '*.EDF'));
-        
-        channelsAdded = [];
-        farosChannelsAdded = 0;
-        
-        if ~isempty(farosFiles)
-            if verboseOutput, fprintf('   🔍 Found %d Faros files\n', length(farosFiles)); end
+        %% Step 2: Load XSens data (if requested)
+        xsensData = [];
+        if includeXSensCoM || includeXSensFootPos
+            if verboseOutput, fprintf('\n🔄 Loading XSens data...\n'); end
             
-            farosDataMerged = [];
-            
-            % Process each Faros file
-            for f = 1:length(farosFiles)
-                filepath = fullfile(subjectRawPath, farosFiles(f).name);
-                if verboseOutput, fprintf('   📥 Reading %s\n', farosFiles(f).name); end
+            xsensFile = fullfile(subjectPath, sprintf('%s_xsens.mat', subjectFolder));
+            if exist(xsensFile, 'file')
+                xsensLoad = load(xsensFile);
+                xsensData = xsensLoad.xsensData;
                 
-                try
-                    farosImport = edfread(filepath);
-                    farosInfo = edfinfo(filepath);
-                    
-                    % Extract ECG and accelerometer data
-                    if isfield(farosImport, 'ECG')
-                        ecgData = cell2mat(farosImport.ECG);
-                        ecgSampleRate = farosInfo.NumSamples(1) / farosInfo.DataRecordDuration;
-                        ecgTime = (0:size(ecgData,1)-1) / ecgSampleRate;
-                        
-                        if verboseOutput, fprintf('      📊 ECG: %d samples at %.1f Hz\n', length(ecgData), ecgSampleRate); end
-                    else
-                        error('No ECG data found in Faros file');
-                    end
-                    
-                    % Process accelerometer data
-                    accData = [];
-                    accLabels = {};
-                    if isfield(farosImport, 'Accelerometer_X')
-                        accX = cell2mat(farosImport.Accelerometer_X);
-                        accY = cell2mat(farosImport.Accelerometer_Y);
-                        accZ = cell2mat(farosImport.Accelerometer_Z);
-                        accSampleRate = farosInfo.NumSamples(2) / farosInfo.DataRecordDuration;
-                        
-                        % Interpolate ACC to ECG sampling rate
-                        accTime = (0:size(accX,1)-1) / accSampleRate;
-                        accXInterp = interp1(accTime, accX, ecgTime, 'linear', 'extrap');
-                        accYInterp = interp1(accTime, accY, ecgTime, 'linear', 'extrap');
-                        accZInterp = interp1(accTime, accZ, ecgTime, 'linear', 'extrap');
-                        
-                        accData = [accXInterp', accYInterp', accZInterp'];
-                        accLabels = {'FarosAccX', 'FarosAccY', 'FarosAccZ'};
-                        
-                        if verboseOutput, fprintf('      📊 ACC: %d samples at %.1f Hz (interpolated to ECG rate)\n', length(accX), accSampleRate); end
-                    end
-                    
-                    % Create time-stamped data matrix
-                    farosDataCurrent = [ecgTime', ecgData, accData];
-                    
-                    % Merge with existing data
-                    if isempty(farosDataMerged)
-                        farosDataMerged = farosDataCurrent;
-                    else
-                        % Simple concatenation - assumes files are in chronological order
-                        timeOffset = farosDataMerged(end,1) + 1/ecgSampleRate;
-                        farosDataCurrent(:,1) = farosDataCurrent(:,1) + timeOffset;
-                        farosDataMerged = [farosDataMerged; farosDataCurrent];
-                    end
-                    
-                catch ME
-                    if verboseOutput
-                        fprintf('      ❌ Error reading %s: %s\n', farosFiles(f).name, ME.message);
-                    end
-                    continue;
-                end
-            end
-            
-            % Process merged Faros data
-            if ~isempty(farosDataMerged)
-                % Convert relative time to XDF time using alignment
-                % Use first available sync point from original LSL data
-                farosLSLIdx = [];
-                for i = 1:length(streams)
-                    if contains(streams{i}.info.name, 'faros_ecg', 'IgnoreCase', true)
-                        farosLSLIdx = i;
-                        break;
-                    end
-                end
-                
-                if ~isempty(farosLSLIdx)
-                    % Use cross-correlation to find time offset
-                    farosLSLData = streams{farosLSLIdx}.time_series;
-                    farosLSLTime = streams{farosLSLIdx}.time_stamps;
-                    
-                    % Resample LSL data to match Faros sampling rate
-                    lslECGResampled = interp1(farosLSLTime, farosLSLData, ...
-                                            farosLSLTime(1):1/ecgSampleRate:farosLSLTime(end), 'pchip');
-                    
-                    % Find best alignment using cross-correlation
-                    [r, lags] = xcorr(farosDataMerged(:,2), lslECGResampled);
-                    [~, maxIdx] = max(r);
-                    offsetSamples = lags(maxIdx);
-                    offsetTime = offsetSamples / ecgSampleRate;
-                    
-                    % Apply time offset
-                    farosDataMerged(:,1) = farosDataMerged(:,1) + farosLSLTime(1) + offsetTime;
-                    
-                    if verboseOutput
-                        fprintf('   🔧 Faros time alignment: offset = %.3f seconds (r_max = %.3f)\n', offsetTime, max(r));
-                    end
-                else
-                    % Fallback: use EEG start time
-                    farosDataMerged(:,1) = farosDataMerged(:,1) + eegTimeStart;
-                    if verboseOutput, fprintf('   ⚠️ Using fallback time alignment (no LSL Faros reference)\n'); end
-                end
-                
-                % Filter to EEG time range
-                timeFilter = farosDataMerged(:,1) >= eegTimeStart & farosDataMerged(:,1) <= eegTimeEnd;
-                farosFiltered = farosDataMerged(timeFilter, :);
-                
-                if ~isempty(farosFiltered)
-                    % Interpolate to EEG sample times
-                    ecgInterp = interp1(farosFiltered(:,1), farosFiltered(:,2), eegTimesXdf, interpolationMethod, NaN);
-                    
-                    % Check coverage
-                    ecgCoverage = sum(~isnan(ecgInterp)) / length(ecgInterp);
-                    
-                    if ecgCoverage >= minDataCoverage
-                        % Add ECG channel
-                        newIdx = eeg.nbchan + 1;
-                        eeg.data(newIdx, :) = ecgInterp;
-                        eeg.chanlocs(newIdx).labels = 'FarosECG';
-                        eeg.chanlocs(newIdx).type = 'ECG';
-                        eeg.nbchan = newIdx;
-                        channelsAdded(end+1) = newIdx;
-                        farosChannelsAdded = farosChannelsAdded + 1;
-                        
-                        if verboseOutput
-                            fprintf('   ✅ Added ECG channel (%.1f%% coverage)\n', ecgCoverage * 100);
-                        end
-                    else
-                        if verboseOutput
-                            fprintf('   ⚠️ ECG coverage too low (%.1f%% < %.1f%%)\n', ecgCoverage * 100, minDataCoverage * 100);
-                        end
-                    end
-                    
-                    % Add accelerometer channels
-                    if size(farosFiltered, 2) > 2
-                        for accCh = 1:3
-                            if size(farosFiltered, 2) > 2 + accCh - 1
-                                accInterp = interp1(farosFiltered(:,1), farosFiltered(:,2+accCh), eegTimesXdf, interpolationMethod, NaN);
-                                accCoverage = sum(~isnan(accInterp)) / length(accInterp);
-                                
-                                if accCoverage >= minDataCoverage
-                                    newIdx = eeg.nbchan + 1;
-                                    eeg.data(newIdx, :) = accInterp;
-                                    eeg.chanlocs(newIdx).labels = accLabels{accCh};
-                                    eeg.chanlocs(newIdx).type = 'ACC';
-                                    eeg.nbchan = newIdx;
-                                    channelsAdded(end+1) = newIdx;
-                                    farosChannelsAdded = farosChannelsAdded + 1;
-                                    
-                                    if verboseOutput
-                                        fprintf('   ✅ Added %s channel (%.1f%% coverage)\n', accLabels{accCh}, accCoverage * 100);
-                                    end
-                                else
-                                    if verboseOutput
-                                        fprintf('   ⚠️ %s coverage too low (%.1f%% < %.1f%%)\n', accLabels{accCh}, accCoverage * 100, minDataCoverage * 100);
-                                    end
-                                end
-                            end
-                        end
-                    end
-                else
-                    if verboseOutput, fprintf('   ⚠️ No Faros data in EEG time range\n'); end
+                if verboseOutput
+                    fprintf('   ✅ XSens data loaded from: %s\n', xsensFile);
+                    fprintf('   📊 Available data types: %s\n', strjoin(fieldnames(xsensData), ', '));
                 end
             else
-                if verboseOutput, fprintf('   ⚠️ No valid Faros data loaded\n'); end
-            end
-        else
-            if verboseOutput, fprintf('   ⚠️ No Faros files found\n'); end
-        end
-        
-        if verboseOutput, fprintf('   📊 Added %d Faros channels\n\n', farosChannelsAdded); end
-        
-        %% Step 4: Load and process Xsens Center of Mass data
-        if verboseOutput, fprintf('🤸 Loading Xsens Center of Mass data...\n'); end
-        
-        xsensFiles = dir(fullfile(subjectRawPath, '*xsens*.mat'));
-        xsensChannelsAdded = 0;
-        
-        if ~isempty(xsensFiles)
-            if verboseOutput, fprintf('   🔍 Found %d Xsens files\n', length(xsensFiles)); end
-            
-            try
-                xsensPath = fullfile(subjectRawPath, xsensFiles(1).name);
-                if verboseOutput, fprintf('   📥 Reading %s\n', xsensFiles(1).name); end
-                
-                xsensData = load(xsensPath);
-                
-                if isfield(xsensData, 'xsensData') && isfield(xsensData.xsensData, 'center_of_mass')
-                    xsensCoMData = [];
-                    xsensTimeData = [];
-                    
-                    % Process each recording segment
-                    for x = 1:length(xsensData.xsensData.center_of_mass)
-                        frameRate = xsensData.xsensData.info{x}{5,2};
-                        comData = xsensData.xsensData.center_of_mass{x};
-                        
-                        % Create time vector
-                        segmentTime = (0:height(comData)-1) / frameRate;
-                        
-                        % Convert to XDF time using LSL reference
-                        xsensLSLIdx = [];
-                        for i = 1:length(streams)
-                            if contains(streams{i}.info.name, 'CenterOfMass', 'IgnoreCase', true)
-                                xsensLSLIdx = i;
-                                break;
-                            end
-                        end
-                        
-                        if ~isempty(xsensLSLIdx)
-                            % Use cross-correlation for time alignment
-                            lslCoMX = streams{xsensLSLIdx}.time_series(1,:);
-                            lslTime = streams{xsensLSLIdx}.time_stamps;
-                            
-                            % Resample LSL data
-                            lslCoMResampled = interp1(lslTime, lslCoMX, lslTime(1):1/frameRate:lslTime(end), 'pchip');
-                            
-                            % Find alignment
-                            [r, lags] = xcorr(lslCoMResampled, comData.CoMPosX);
-                            [~, maxIdx] = max(r);
-                            offsetTime = lags(maxIdx) / frameRate;
-                            
-                            segmentTime = segmentTime + lslTime(1) + offsetTime;
-                            
-                            if verboseOutput
-                                fprintf('      🔧 Segment %d alignment: offset = %.3f s, r_max = %.3f\n', x, offsetTime, max(r));
-                            end
-                        else
-                            % Fallback alignment
-                            segmentTime = segmentTime + eegTimeStart + x * 60; % Assume 1-minute segments
-                            if verboseOutput, fprintf('      ⚠️ Using fallback alignment for segment %d\n', x); end
-                        end
-                        
-                        % Add to merged data
-                        xsensTimeData = [xsensTimeData, segmentTime];
-                        
-                        comArray = table2array(comData(:, 2:end)); % Skip time column
-                        if isempty(xsensCoMData)
-                            xsensCoMData = comArray';
-                        else
-                            xsensCoMData = [xsensCoMData, comArray'];
-                        end
-                    end
-                    
-                    % Filter to EEG time range
-                    timeFilter = xsensTimeData >= eegTimeStart & xsensTimeData <= eegTimeEnd;
-                    xsensTimeFiltered = xsensTimeData(timeFilter);
-                    xsensDataFiltered = xsensCoMData(:, timeFilter);
-                    
-                    if ~isempty(xsensTimeFiltered)
-                        % Get channel names from the first segment
-                        comChannelNames = xsensData.xsensData.center_of_mass{1}.Properties.VariableNames(2:end);
-                        
-                        % Add each CoM channel
-                        for ch = 1:size(xsensDataFiltered, 1)
-                            comInterp = interp1(xsensTimeFiltered, xsensDataFiltered(ch, :), eegTimesXdf, interpolationMethod, NaN);
-                            comCoverage = sum(~isnan(comInterp)) / length(comInterp);
-                            
-                            if comCoverage >= minDataCoverage
-                                newIdx = eeg.nbchan + 1;
-                                eeg.data(newIdx, :) = comInterp;
-                                eeg.chanlocs(newIdx).labels = ['CoM_' comChannelNames{ch}];
-                                eeg.chanlocs(newIdx).type = 'Xsens';
-                                eeg.nbchan = newIdx;
-                                channelsAdded(end+1) = newIdx;
-                                xsensChannelsAdded = xsensChannelsAdded + 1;
-                                
-                                if verboseOutput
-                                    fprintf('   ✅ Added %s channel (%.1f%% coverage)\n', comChannelNames{ch}, comCoverage * 100);
-                                end
-                            else
-                                if verboseOutput
-                                    fprintf('   ⚠️ %s coverage too low (%.1f%% < %.1f%%)\n', comChannelNames{ch}, comCoverage * 100, minDataCoverage * 100);
-                                end
-                            end
-                        end
-                    else
-                        if verboseOutput, fprintf('   ⚠️ No Xsens data in EEG time range\n'); end
-                    end
-                else
-                    if verboseOutput, fprintf('   ⚠️ Invalid Xsens data structure\n'); end
-                end
-                
-            catch ME
                 if verboseOutput
-                    fprintf('   ❌ Error loading Xsens data: %s\n', ME.message);
+                    fprintf('   ⚠️ XSens file not found: %s (run WaS4_01_xSensToMat.m first)\n', xsensFile);
                 end
+                if includeXSensCoM, includeXSensCoM = false; end
+                if includeXSensFootPos, includeXSensFootPos = false; end
             end
-        else
-            if verboseOutput, fprintf('   ⚠️ No Xsens files found\n'); end
         end
         
-        if verboseOutput, fprintf('   📊 Added %d Xsens CoM channels\n\n', xsensChannelsAdded); end
-        
-        %% Step 5: Load and process Pupil Labs IMU data
-        if verboseOutput, fprintf('📱 Loading Pupil Labs IMU data...\n'); end
-        
-        pupilDirs = dir(fullfile(subjectRawPath, '*pupil*'));
-        pupilDirs = pupilDirs([pupilDirs.isdir]);
-        imuChannelsAdded = 0;
-        
-        if ~isempty(pupilDirs)
-            if verboseOutput, fprintf('   🔍 Found %d Pupil Labs folders\n', length(pupilDirs)); end
+        %% Step 3: Load and merge ECG data (if requested)
+        if includeECG
+            if verboseOutput, fprintf('\n❤️  Loading ECG data...\n'); end
             
-            pupilIMUData = [];
+            % Find EDF files
+            edfFiles = dir(fullfile(subjectPath, '*.EDF'));
+            if isempty(edfFiles)
+                edfFiles = dir(fullfile(subjectPath, '*.edf'));
+            end
             
-            % Process all pupil directories
-            for pupilIdx = 1:length(pupilDirs)
-                pupilDir = fullfile(subjectRawPath, pupilDirs(pupilIdx).name);
-                if verboseOutput, fprintf('   📂 Processing folder: %s\n', pupilDirs(pupilIdx).name); end
+            if ~isempty(edfFiles)
+                farosData = [];
                 
-                % Find actual data folder
-                dataFolders = dir(pupilDir);
-                dataFolders = dataFolders([dataFolders.isdir] & ~strcmp({dataFolders.name}, '.') & ~strcmp({dataFolders.name}, '..'));
-                
-                if ~isempty(dataFolders)
-                    [~, latest_idx] = max([dataFolders.datenum]);
-                    pupilDataPath = fullfile(pupilDir, dataFolders(latest_idx).name);
-                else
-                    pupilDataPath = pupilDir;
-                end
-                
-                % Look for IMU.csv
-                imuPath = fullfile(pupilDataPath, 'IMU.csv');
-                if exist(imuPath, 'file')
+                for f = 1:length(edfFiles)
+                    edfFile = fullfile(subjectPath, edfFiles(f).name);
+                    if verboseOutput, fprintf('   📥 Reading: %s\n', edfFiles(f).name); end
+                    
                     try
-                        if verboseOutput, fprintf('      📥 Reading IMU.csv\n'); end
+                        farosImport = edfread(edfFile);
+                        farosInfo = edfinfo(edfFile);
+                        ecgSampRate = farosInfo.NumSamples(1);
                         
-                        imuData = readtable(imuPath);
+                        % Extract ECG and accelerometer data
+                        newECGData = cell2mat(farosImport.ECG);
+                        newECGTime = (0:length(newECGData)-1) * (1/ecgSampRate);
                         
-                        if height(imuData) > 0
-                            if verboseOutput, fprintf('         📊 IMU data: %d samples\n', height(imuData)); end
+                        % Handle accelerometer data if available
+                        if isfield(farosImport, 'Accelerometer_X')
+                            newACCData = [cell2mat(farosImport.Accelerometer_X), ...
+                                         cell2mat(farosImport.Accelerometer_Y), ...
+                                         cell2mat(farosImport.Accelerometer_Z)];
+                            accSampRate = farosInfo.NumSamples(2);
+                            newACCTime = (0:size(newACCData,1)-1) * (1/accSampRate);
                             
-                            % Find timestamp column
-                            timestampCol = find_timestamp_column_imu(imuData);
-                            if isempty(timestampCol)
-                                if verboseOutput, fprintf('         ⚠️ No timestamp column found\n'); end
-                                continue;
-                            end
-                            
-                            % Convert timestamps to XDF time
-                            imuData.timestamp_xdf = csv_to_xdf_time(imuData.(timestampCol));
-                            
-                            % Merge with existing data
-                            if isempty(pupilIMUData)
-                                pupilIMUData = imuData;
-                            else
-                                pupilIMUData = vertcat(pupilIMUData, imuData);
+                            % Interpolate ACC to ECG sampling rate
+                            accResampled = zeros(length(newECGTime), 3);
+                            for a = 1:3
+                                accResampled(:,a) = interp1(newACCTime, newACCData(:,a), newECGTime, 'makima');
                             end
                         else
-                            if verboseOutput, fprintf('         ⚠️ Empty IMU data\n'); end
+                            accResampled = zeros(length(newECGTime), 3);
+                        end
+                        
+                        % Combine data: [time, ECG, AccX, AccY, AccZ]
+                        newFarosData = [newECGTime', newECGData, accResampled];
+                        farosData = [farosData; newFarosData];
+                        
+                        if verboseOutput
+                            fprintf('      ✅ %d samples, %.1f Hz, %.1f minutes\n', ...
+                                   length(newECGData), ecgSampRate, max(newECGTime)/60);
                         end
                         
                     catch ME
                         if verboseOutput
-                            fprintf('         ❌ Error reading IMU.csv: %s\n', ME.message);
+                            fprintf('      ❌ Error reading %s: %s\n', edfFiles(f).name, ME.message);
+                        end
+                    end
+                end
+                
+                if ~isempty(farosData)
+                    % Add ECG to EEG structure
+                    newChannelIdx = eeg.nbchan + 1;
+                    
+                    % Create time vector for EEG samples
+                    eegTimes = eeg.times / 1000; % Convert to seconds
+                    
+                    % Simple time alignment: assume ECG starts at EEG start
+                    % For more sophisticated alignment, cross-correlation could be used here
+                    farosData(:,1) = farosData(:,1) + eegTimes(1);
+                    
+                    % Filter to EEG time range
+                    timeFilter = farosData(:,1) >= eegTimes(1) & farosData(:,1) <= eegTimes(end);
+                    farosFiltered = farosData(timeFilter, :);
+                    
+                    if size(farosFiltered, 1) > 100  % Ensure we have sufficient data
+                        % Interpolate to EEG sample times
+                        ecgInterp = interp1(farosFiltered(:,1), farosFiltered(:,2), eegTimes, 'cubic', NaN);
+                        
+                        % Expand EEG data matrix to accommodate new channels
+                        newChannelIdx = eeg.nbchan + 1;
+                        eeg.data(newChannelIdx, :) = ecgInterp;
+                        eeg.chanlocs(newChannelIdx).labels = 'ECG_Faros';
+                        eeg.chanlocs(newChannelIdx).type = 'ECG';
+                        eeg.nbchan = eeg.nbchan + 1;
+                        stats.channels_added = stats.channels_added + 1;
+                        
+                        % Add accelerometer channels if available
+                        if size(farosFiltered, 2) >= 5
+                            for a = 1:3
+                                accInterp = interp1(farosFiltered(:,1), farosFiltered(:,a+2), eegTimes, 'cubic', NaN);
+                                newChannelIdx = eeg.nbchan + 1;
+                                eeg.data(newChannelIdx, :) = accInterp;
+                                eeg.chanlocs(newChannelIdx).labels = sprintf('ACC_%s_Faros', char('X'+a-1));
+                                eeg.chanlocs(newChannelIdx).type = 'ACC';
+                                eeg.nbchan = eeg.nbchan + 1;
+                                stats.channels_added = stats.channels_added + 1;
+                            end
+                        end
+                        
+                        stats.data_sources_merged{end+1} = 'ECG';
+                        
+                        if verboseOutput
+                            validSamples = sum(~isnan(ecgInterp));
+                            coverage = validSamples / length(ecgInterp) * 100;
+                            fprintf('   ✅ ECG merged: %.1f%% coverage (%d valid samples)\n', coverage, validSamples);
+                        end
+                    else
+                        if verboseOutput
+                            fprintf('   ⚠️ Insufficient ECG data after time filtering\n');
                         end
                     end
                 else
-                    if verboseOutput, fprintf('      ⚠️ IMU.csv not found\n'); end
+                    if verboseOutput
+                        fprintf('   ⚠️ No valid ECG data found\n');
+                    end
+                end
+            else
+                if verboseOutput
+                    fprintf('   ⚠️ No EDF files found for ECG data\n');
+                end
+            end
+        end
+        
+        %% Step 4: Load and merge Pupil Labs IMU data (if requested)
+        if includePupilIMU
+            if verboseOutput, fprintf('\n📱 Loading Pupil Labs IMU data...\n'); end
+            
+            % Find pupil directories
+            pupilDirs = dir(fullfile(subjectPath, '*pupil*'));
+            pupilDirs = pupilDirs([pupilDirs.isdir]);
+            
+            imuData = [];
+            for p = 1:length(pupilDirs)
+                pupilPath = fullfile(subjectPath, pupilDirs(p).name);
+                
+                % Look for timestamped subdirectories
+                subDirs = dir(pupilPath);
+                subDirs = subDirs([subDirs.isdir] & ~strcmp({subDirs.name}, '.') & ~strcmp({subDirs.name}, '..'));
+                
+                if ~isempty(subDirs)
+                    [~, latestIdx] = max([subDirs.datenum]);
+                    pupilDataPath = fullfile(pupilPath, subDirs(latestIdx).name);
+                else
+                    pupilDataPath = pupilPath;
+                end
+                
+                imuFile = fullfile(pupilDataPath, 'IMU.csv');
+                if exist(imuFile, 'file')
+                    if verboseOutput, fprintf('   📥 Reading: %s\n', imuFile); end
+                    
+                    try
+                        imuTable = readtable(imuFile);
+                        if height(imuTable) > 0
+                            imuData = [imuData; imuTable];
+                        end
+                    catch ME
+                        if verboseOutput
+                            fprintf('      ❌ Error reading IMU file: %s\n', ME.message);
+                        end
+                    end
                 end
             end
             
-            % Process merged IMU data
-            if ~isempty(pupilIMUData)
-                % Sort by time
-                pupilIMUData = sortrows(pupilIMUData, 'timestamp_xdf');
+            if ~isempty(imuData) && height(imuData) > 0
+                % Find timestamp column
+                timestampCol = '';
+                possibleTimestampCols = {'timestamp [ns]', 'timestampns', 'timestamp_ns_', 'timestamp'};
+                for col = possibleTimestampCols
+                    if ismember(col{1}, imuData.Properties.VariableNames)
+                        timestampCol = col{1};
+                        break;
+                    end
+                end
                 
-                % Filter to EEG time range
-                timeFilter = pupilIMUData.timestamp_xdf >= eegTimeStart & pupilIMUData.timestamp_xdf <= eegTimeEnd;
-                imuFiltered = pupilIMUData(timeFilter, :);
-                
-                if height(imuFiltered) > 0
-                    % Define IMU channels to extract
-                    imuChannels = {
-                        'gyro_x_rad_s_', 'IMU_GyroX';
-                        'gyro_y_rad_s_', 'IMU_GyroY';
-                        'gyro_z_rad_s_', 'IMU_GyroZ';
-                        'accel_x_m_s2_', 'IMU_AccX';
-                        'accel_y_m_s2_', 'IMU_AccY';
-                        'accel_z_m_s2_', 'IMU_AccZ';
-                        'mag_x_uT_', 'IMU_MagX';
-                        'mag_y_uT_', 'IMU_MagY';
-                        'mag_z_uT_', 'IMU_MagZ'
-                    };
+                if ~isempty(timestampCol)
+                    % Convert timestamps to seconds (assuming nanoseconds)
+                    imuTimes = imuData.(timestampCol) * 1e-9;
                     
-                    % Add each IMU channel
-                    for ch = 1:size(imuChannels, 1)
-                        csvColName = imuChannels{ch, 1};
-                        eegChLabel = imuChannels{ch, 2};
+                    % Find gyroscope and accelerometer columns
+                    gyroCols = {};
+                    accelCols = {};
+                    
+                    varNames = imuData.Properties.VariableNames;
+                    for v = 1:length(varNames)
+                        varName = varNames{v};
+                        if contains(varName, {'gyro', 'Gyro'}, 'IgnoreCase', true)
+                            gyroCols{end+1} = varName;
+                        elseif contains(varName, {'accel', 'Accel'}, 'IgnoreCase', true)
+                            accelCols{end+1} = varName;
+                        end
+                    end
+                    
+                    if ~isempty(gyroCols) || ~isempty(accelCols)
+                        % Align IMU times with EEG times (simple offset alignment)
+                        eegTimes = eeg.times / 1000;
+                        timeOffset = eegTimes(1) - imuTimes(1);
+                        imuTimesAligned = imuTimes + timeOffset;
                         
-                        % Try flexible column name matching
-                        actualCol = find_imu_column(imuFiltered.Properties.VariableNames, csvColName);
+                        % Filter to EEG time range
+                        timeFilter = imuTimesAligned >= eegTimes(1) & imuTimesAligned <= eegTimes(end);
+                        imuFiltered = imuData(timeFilter, :);
+                        imuTimesFiltered = imuTimesAligned(timeFilter);
                         
-                        if ~isempty(actualCol)
-                            imuInterp = interp1(imuFiltered.timestamp_xdf, imuFiltered.(actualCol), eegTimesXdf, interpolationMethod, NaN);
-                            imuCoverage = sum(~isnan(imuInterp)) / length(imuInterp);
-                            
-                            if imuCoverage >= minDataCoverage
-                                newIdx = eeg.nbchan + 1;
-                                eeg.data(newIdx, :) = imuInterp;
-                                eeg.chanlocs(newIdx).labels = eegChLabel;
-                                eeg.chanlocs(newIdx).type = 'IMU';
-                                eeg.nbchan = newIdx;
-                                channelsAdded(end+1) = newIdx;
-                                imuChannelsAdded = imuChannelsAdded + 1;
+                        if height(imuFiltered) > 10
+                            % Add gyroscope channels
+                            for g = 1:min(3, length(gyroCols))
+                                gyroData = imuFiltered.(gyroCols{g});
+                                gyroInterp = interp1(imuTimesFiltered, gyroData, eegTimes, 'cubic', NaN);
                                 
-                                if verboseOutput
-                                    fprintf('   ✅ Added %s channel (%.1f%% coverage)\n', eegChLabel, imuCoverage * 100);
-                                end
-                            else
-                                if verboseOutput
-                                    fprintf('   ⚠️ %s coverage too low (%.1f%% < %.1f%%)\n', eegChLabel, imuCoverage * 100, minDataCoverage * 100);
-                                end
+                                newChannelIdx = eeg.nbchan + 1;
+                                eeg.data(newChannelIdx, :) = gyroInterp;
+                                eeg.chanlocs(newChannelIdx).labels = sprintf('Gyro_%s', gyroCols{g});
+                                eeg.chanlocs(newChannelIdx).type = 'IMU';
+                                eeg.nbchan = eeg.nbchan + 1;
+                                stats.channels_added = stats.channels_added + 1;
+                            end
+                            
+                            % Add accelerometer channels
+                            for a = 1:min(3, length(accelCols))
+                                accelData = imuFiltered.(accelCols{a});
+                                accelInterp = interp1(imuTimesFiltered, accelData, eegTimes, 'cubic', NaN);
+                                
+                                newChannelIdx = eeg.nbchan + 1;
+                                eeg.data(newChannelIdx, :) = accelInterp;
+                                eeg.chanlocs(newChannelIdx).labels = sprintf('Accel_%s', accelCols{a});
+                                eeg.chanlocs(newChannelIdx).type = 'IMU';
+                                eeg.nbchan = eeg.nbchan + 1;
+                                stats.channels_added = stats.channels_added + 1;
+                            end
+                            
+                            stats.data_sources_merged{end+1} = 'PupilIMU';
+                            
+                            if verboseOutput
+                                fprintf('   ✅ IMU merged: %d gyro + %d accel channels\n', ...
+                                       min(3, length(gyroCols)), min(3, length(accelCols)));
                             end
                         else
                             if verboseOutput
-                                fprintf('   ⚠️ IMU column %s not found\n', csvColName);
+                                fprintf('   ⚠️ Insufficient IMU data after time filtering\n');
                             end
+                        end
+                    else
+                        if verboseOutput
+                            fprintf('   ⚠️ No gyro/accelerometer columns found in IMU data\n');
                         end
                     end
                 else
-                    if verboseOutput, fprintf('   ⚠️ No IMU data in EEG time range\n'); end
+                    if verboseOutput
+                        fprintf('   ⚠️ No timestamp column found in IMU data\n');
+                    end
                 end
             else
-                if verboseOutput, fprintf('   ⚠️ No IMU data loaded\n'); end
+                if verboseOutput
+                    fprintf('   ⚠️ No valid IMU data found\n');
+                end
             end
-        else
-            if verboseOutput, fprintf('   ⚠️ No Pupil Labs folders found\n'); end
         end
         
-        if verboseOutput, fprintf('   📊 Added %d IMU channels\n\n', imuChannelsAdded); end
+        %% Step 5: Merge XSens Center of Mass data (if requested)
+        if includeXSensCoM && ~isempty(xsensData) && isfield(xsensData, 'center_of_mass')
+            if verboseOutput, fprintf('\n🏃 Merging XSens Center of Mass...\n'); end
+            
+            try
+                % Load alignment data to get counter-LSL time mapping
+                alignmentDataFile = fullfile(alignedPath, sprintf('%s_alignment_data.mat', subjectFolder));
+                if exist(alignmentDataFile, 'file')
+                    alignmentLoad = load(alignmentDataFile);
+                    alignmentReport = alignmentLoad.alignmentData.alignmentReport;
+                    
+                    % Extract time mapping function
+                    intercept = alignmentReport.intercept;
+                    slope = alignmentReport.slope;
+                    csv_to_xdf_time = @(csv_time_ns) intercept + slope * (csv_time_ns * 1e-9);
+                    
+                    % Process each XSens data file
+                    xsensCoMData = [];
+                    for x = 1:length(xsensData.center_of_mass)
+                        if istable(xsensData.center_of_mass{x}) && height(xsensData.center_of_mass{x}) > 0
+                            comTable = xsensData.center_of_mass{x};
+                            
+                            % Assume 60 Hz frame rate if not specified in info
+                            frameRate = 60;
+                            if isfield(xsensData, 'info') && length(xsensData.info) >= x
+                                try
+                                    frameRate = xsensData.info{x}{5,2};
+                                catch
+                                    frameRate = 60; % fallback
+                                end
+                            end
+                            
+                            % Create time vector
+                            numFrames = height(comTable);
+                            xsensTime = (0:numFrames-1) / frameRate;
+                            
+                            % Simple time alignment (more sophisticated alignment could be implemented)
+                            eegTimes = eeg.times / 1000;
+                            timeOffset = eegTimes(1);
+                            xsensTimeAligned = xsensTime + timeOffset;
+                            
+                            % Filter to EEG time range
+                            timeFilter = xsensTimeAligned >= eegTimes(1) & xsensTimeAligned <= eegTimes(end);
+                            comFiltered = comTable(timeFilter, :);
+                            xsensTimesFiltered = xsensTimeAligned(timeFilter);
+                            
+                            if height(comFiltered) > 10
+                                % Extract Center of Mass position columns
+                                comCols = {};
+                                varNames = comFiltered.Properties.VariableNames;
+                                for v = 1:length(varNames)
+                                    varName = varNames{v};
+                                    if contains(varName, {'CoM', 'pos'}, 'IgnoreCase', true) && ...
+                                       contains(varName, {'X', 'Y', 'Z'}, 'IgnoreCase', true)
+                                        comCols{end+1} = varName;
+                                    end
+                                end
+                                
+                                if ~isempty(comCols)
+                                    for c = 1:length(comCols)
+                                        colName = comCols{c};
+                                        comData = comFiltered.(colName);
+                                        comInterp = interp1(xsensTimesFiltered, comData, eegTimes, 'cubic', NaN);
+                                        
+                                        newChannelIdx = eeg.nbchan + 1;
+                                        eeg.data(newChannelIdx, :) = comInterp;
+                                        eeg.chanlocs(newChannelIdx).labels = sprintf('CoM_%s', colName);
+                                        eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                        eeg.nbchan = eeg.nbchan + 1;
+                                        stats.channels_added = stats.channels_added + 1;
+                                    end
+                                    
+                                    if verboseOutput
+                                        fprintf('   ✅ Added %d Center of Mass channels\n', length(comCols));
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    
+                    if stats.channels_added > 0
+                        stats.data_sources_merged{end+1} = 'XSensCoM';
+                    end
+                else
+                    if verboseOutput
+                        fprintf('   ⚠️ Alignment data not found, using simple time alignment\n');
+                    end
+                end
+            catch ME
+                if verboseOutput
+                    fprintf('   ❌ Error merging XSens CoM: %s\n', ME.message);
+                end
+            end
+        end
         
-        %% Step 6: Create quality plots
-        if createPlots
-            if verboseOutput, fprintf('📈 Creating quality plots...\n'); end
+        %% Step 6: Merge XSens Foot Position data (if requested)
+        if includeXSensFootPos && ~isempty(xsensData) && isfield(xsensData, 'segment_position')
+            if verboseOutput, fprintf('\n🦶 Merging XSens Foot Position...\n'); end
             
-            fig = figure('Position', [100, 100, 1600, 1000], 'Name', sprintf('%s - Continuous Data Quality', subjectFolder));
-            
-            totalNewChannels = farosChannelsAdded + xsensChannelsAdded + imuChannelsAdded;
-            
-            if totalNewChannels > 0
-                % Plot 1: Data coverage for new channels
-                subplot(2, 3, 1);
-                if ~isempty(channelsAdded)
-                    coverage = [];
-                    labels = {};
-                    for ch = channelsAdded
-                        validData = ~isnan(eeg.data(ch, :));
-                        coverage(end+1) = sum(validData) / length(validData) * 100;
-                        labels{end+1} = eeg.chanlocs(ch).labels;
-                    end
-                    
-                    barh(coverage);
-                    set(gca, 'YTickLabel', labels, 'YTick', 1:length(labels));
-                    xlabel('Coverage (%)');
-                    title('Data Coverage by Channel');
-                    grid on;
-                end
-                
-                % Plot 2: Sample data from new channels
-                subplot(2, 3, 2);
-                if ~isempty(channelsAdded) && length(channelsAdded) >= 1
-                    % Show first new channel
-                    ch = channelsAdded(1);
-                    timeAxis = (1:eeg.pnts) / eeg.srate;
-                    plot(timeAxis, eeg.data(ch, :));
-                    xlabel('Time (s)');
-                    ylabel('Amplitude');
-                    title(sprintf('Sample Data: %s', eeg.chanlocs(ch).labels));
-                    grid on;
-                end
-                
-                % Plot 3: Channel type summary
-                subplot(2, 3, 3);
-                channelTypes = {};
-                for ch = channelsAdded
-                    channelTypes{end+1} = eeg.chanlocs(ch).type;
-                end
-                if ~isempty(channelTypes)
-                    [uniqueTypes, ~, idx] = unique(channelTypes);
-                    counts = accumarray(idx, 1);
-                    pie(counts, uniqueTypes);
-                    title('Added Channels by Type');
-                end
-                
-                % Plot 4-6: Time series examples for each data type
-                plotIdx = 4;
-                dataTypes = {'ECG', 'Xsens', 'IMU'};
-                for dt = 1:length(dataTypes)
-                    subplot(2, 3, plotIdx);
-                    plotIdx = plotIdx + 1;
-                    
-                    % Find channels of this type
-                    typeChannels = [];
-                    for ch = channelsAdded
-                        if strcmp(eeg.chanlocs(ch).type, dataTypes{dt}) || contains(eeg.chanlocs(ch).labels, dataTypes{dt})
-                            typeChannels(end+1) = ch;
+            try
+                % Process each XSens segment position file
+                for x = 1:length(xsensData.segment_position)
+                    if istable(xsensData.segment_position{x}) && height(xsensData.segment_position{x}) > 0
+                        segTable = xsensData.segment_position{x};
+                        
+                        % Find foot position columns
+                        footCols = {};
+                        varNames = segTable.Properties.VariableNames;
+                        for v = 1:length(varNames)
+                            varName = varNames{v};
+                            if contains(varName, {'Foot'}, 'IgnoreCase', true) && ...
+                               contains(varName, {'Z'}, 'IgnoreCase', true)
+                                footCols{end+1} = varName;
+                            end
+                        end
+                        
+                        if ~isempty(footCols)
+                            % Assume 60 Hz frame rate
+                            frameRate = 60;
+                            if isfield(xsensData, 'info') && length(xsensData.info) >= x
+                                try
+                                    frameRate = xsensData.info{x}{5,2};
+                                catch
+                                    frameRate = 60;
+                                end
+                            end
+                            
+                            numFrames = height(segTable);
+                            xsensTime = (0:numFrames-1) / frameRate;
+                            
+                            % Simple time alignment
+                            eegTimes = eeg.times / 1000;
+                            timeOffset = eegTimes(1);
+                            xsensTimeAligned = xsensTime + timeOffset;
+                            
+                            newChannelIdx = eeg.nbchan + 1;
+                            
+                            for f = 1:length(footCols)
+                                colName = footCols{f};
+                                footData = segTable.(colName);
+                                footInterp = interp1(xsensTimeAligned, footData, eegTimes, 'cubic', NaN);
+                                
+                                eeg.data(newChannelIdx, :) = footInterp;
+                                eeg.chanlocs(newChannelIdx).labels = colName;
+                                eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                newChannelIdx = newChannelIdx + 1;
+                                stats.channels_added = stats.channels_added + 1;
+                            end
+                            
+                            if verboseOutput
+                                fprintf('   ✅ Added %d foot position channels\n', length(footCols));
+                            end
+                            
+                            stats.data_sources_merged{end+1} = 'XSensFootPos';
                         end
                     end
-                    
-                    if ~isempty(typeChannels)
-                        timeAxis = (1:eeg.pnts) / eeg.srate;
-                        hold on;
-                        colors = lines(length(typeChannels));
-                        for i = 1:min(3, length(typeChannels)) % Show max 3 channels
-                            ch = typeChannels(i);
-                            plot(timeAxis, eeg.data(ch, :), 'Color', colors(i, :), 'DisplayName', eeg.chanlocs(ch).labels);
-                        end
-                        xlabel('Time (s)');
-                        ylabel('Amplitude');
-                        title(sprintf('%s Data', dataTypes{dt}));
-                        legend('Location', 'best');
-                        grid on;
-                    else
-                        text(0.5, 0.5, sprintf('No %s data added', dataTypes{dt}), ...
-                             'Units', 'normalized', 'HorizontalAlignment', 'center');
-                        title(sprintf('%s Data', dataTypes{dt}));
-                    end
                 end
-            else
-                % No channels added
-                text(0.5, 0.5, 'No continuous channels were added', ...
-                     'Units', 'normalized', 'HorizontalAlignment', 'center', 'FontSize', 16);
-                title('No Data Added');
+            catch ME
+                if verboseOutput
+                    fprintf('   ❌ Error merging XSens foot position: %s\n', ME.message);
+                end
             end
-            
-            if savePlots && totalNewChannels > 0
-                plotPath = fullfile(outputPath, sprintf('%s_continuous_quality.png', subjectFolder));
-                print(fig, plotPath, '-dpng', '-r300');
-                if verboseOutput, fprintf('   💾 Quality plot saved: %s\n', plotPath); end
-            end
-            
-            if verboseOutput, fprintf('   ✅ Quality plots created\n\n'); end
         end
         
         %% Step 7: Update EEG structure and save
-        if verboseOutput, fprintf('💾 Updating EEG structure and saving...\n'); end
+        if verboseOutput, fprintf('\n💾 Finalizing merged data...\n'); end
         
-        % Update EEG structure
-        eeg = eeg_checkset(eeg);
+        % Update EEG structure - nbchan should already be updated
+        eeg = eeg_checkset(eeg, 'eventconsistency');
         
-        % Save enhanced EEG file
+        % Record processing statistics
+        stats.final_channels = eeg.nbchan;
+        stats.processing_time_seconds = toc(startTime);
+        stats.data_sources_merged = strjoin(stats.data_sources_merged, ', ');
+        mergeStats = [mergeStats; stats];
+        
+        if verboseOutput
+            fprintf('   📊 Channels: %d → %d (+%d added)\n', ...
+                   stats.original_channels, stats.final_channels, stats.channels_added);
+            fprintf('   🔗 Data sources merged: %s\n', stats.data_sources_merged);
+            fprintf('   ⏱️  Processing time: %.1f seconds\n', stats.processing_time_seconds);
+        end
+        
+        % Save merged EEG file
         if saveResults
-            pop_saveset(eeg, 'filename', sprintf('%s_continuous.set', subjectFolder), 'filepath', outputPath);
+            pop_saveset(eeg, 'filename', sprintf('%s_merged.set', subjectFolder), 'filepath', outPath);
             
-            % Save processing info
-            continuousInfo = struct();
-            continuousInfo.originalChannels = eeg.nbchan - length(channelsAdded);
-            continuousInfo.addedChannels = length(channelsAdded);
-            continuousInfo.farosChannels = farosChannelsAdded;
-            continuousInfo.xsensChannels = xsensChannelsAdded;
-            continuousInfo.imuChannels = imuChannelsAdded;
-            continuousInfo.addedChannelIndices = channelsAdded;
-            continuousInfo.processingOptions.interpolationMethod = interpolationMethod;
-            continuousInfo.processingOptions.maxTimeGap = maxTimeGap;
-            continuousInfo.processingOptions.minDataCoverage = minDataCoverage;
-            continuousInfo.processingInfo.timestamp = datetime('now');
-            continuousInfo.processingInfo.matlabVersion = version;
-            continuousInfo.processingInfo.script = mfilename;
-            
-            infoPath = fullfile(outputPath, sprintf('%s_continuous_info.mat', subjectFolder));
-            save(infoPath, 'continuousInfo', '-v7.3');
+            % Save merge statistics
+            mergeInfoFile = fullfile(outPath, sprintf('%s_merge_info.mat', subjectFolder));
+            mergeInfo = struct();
+            mergeInfo.stats = stats;
+            mergeInfo.processing_date = datetime('now');
+            mergeInfo.script_name = mfilename;
+            mergeInfo.matlab_version = version;
+            save(mergeInfoFile, 'mergeInfo', '-v7.3');
             
             if verboseOutput
-                fprintf('   ✅ EEG data saved: %s\n', outputFile);
-                fprintf('   ✅ Processing info saved: %s\n', infoPath);
+                fprintf('   ✅ Saved: %s\n', outputFile);
+                fprintf('   ✅ Merge info saved: %s\n', mergeInfoFile);
             end
         end
         
-        % Record statistics
-        channelStats = [channelStats; struct('subject', subjectFolder, ...
-                                            'originalChannels', eeg.nbchan - length(channelsAdded), ...
-                                            'addedChannels', length(channelsAdded), ...
-                                            'farosChannels', farosChannelsAdded, ...
-                                            'xsensChannels', xsensChannelsAdded, ...
-                                            'imuChannels', imuChannelsAdded)];
+        % Create plots if requested
+        if createPlots && stats.channels_added > 0
+            if verboseOutput, fprintf('   📈 Creating merge plots...\n'); end
+            create_merge_plots(eeg, stats, subjectFolder, outPath, savePlots, verboseOutput);
+        end
         
+        % Mark as successfully processed
         processedSubjects{end+1} = subjectFolder;
         
         if verboseOutput
-            fprintf('\n✅ %s COMPLETED SUCCESSFULLY!\n', subjectFolder);
-            fprintf('   Added channels: %d total (Faros:%d, Xsens:%d, IMU:%d)\n', ...
-                   length(channelsAdded), farosChannelsAdded, xsensChannelsAdded, imuChannelsAdded);
-            fprintf('   Final EEG structure: %d channels, %d samples\n', eeg.nbchan, eeg.pnts);
+            fprintf('\n✅ %s MERGING COMPLETED!\n', subjectFolder);
+            fprintf('   📊 Final EEG structure: %d channels, %d samples\n', eeg.nbchan, eeg.pnts);
+            fprintf('   🔗 Data sources: %s\n', stats.data_sources_merged);
         end
         
     catch ME
+        % Handle errors gracefully
         failedSubjects{end+1} = sprintf('%s: %s', subjectFolder, ME.message);
         
         if verboseOutput
@@ -794,28 +687,25 @@ for s = 1:length(subjectList)
                 fprintf('   Line %d in %s\n', ME.stack(1).line, ME.stack(1).name);
             end
         end
+        
+        % Continue with next subject
         continue;
     end
-    
-    % Close figures
-    close all;
 end
 
 %% ==================== FINAL SUMMARY ====================
 
 if verboseOutput
     fprintf('\n==========================================================\n');
-    fprintf('CONTINUOUS DATA ADDITION PIPELINE SUMMARY\n');
+    fprintf('ADDITIONAL DATA MERGING SUMMARY\n');
     fprintf('==========================================================\n\n');
     
     fprintf('✅ SUCCESSFULLY PROCESSED (%d subjects):\n', length(processedSubjects));
     for i = 1:length(processedSubjects)
-        if i <= length(channelStats)
-            stats = channelStats(i);
-            fprintf('   %s: %d→%d channels (+%d: Faros:%d, Xsens:%d, IMU:%d)\n', ...
-                   stats.subject, stats.originalChannels, ...
-                   stats.originalChannels + stats.addedChannels, stats.addedChannels, ...
-                   stats.farosChannels, stats.xsensChannels, stats.imuChannels);
+        if i <= length(mergeStats)
+            fprintf('   %s (+%d channels, %s, %.1fs)\n', processedSubjects{i}, ...
+                   mergeStats(i).channels_added, mergeStats(i).data_sources_merged, ...
+                   mergeStats(i).processing_time_seconds);
         else
             fprintf('   %s\n', processedSubjects{i});
         end
@@ -836,76 +726,331 @@ if verboseOutput
     end
     
     % Overall statistics
-    if ~isempty(channelStats)
-        allAdded = [channelStats.addedChannels];
-        allFaros = [channelStats.farosChannels];
-        allXsens = [channelStats.xsensChannels];
-        allIMU = [channelStats.imuChannels];
+    if ~isempty(mergeStats)
+        totalChannelsAdded = sum([mergeStats.channels_added]);
+        totalTime = sum([mergeStats.processing_time_seconds]);
         
-        fprintf('\n📊 OVERALL STATISTICS:\n');
-        fprintf('   Channels added per subject - Mean: %.1f, Range: %d-%d\n', ...
-               mean(allAdded), min(allAdded), max(allAdded));
-        fprintf('   Faros channels - Mean: %.1f, Total: %d\n', mean(allFaros), sum(allFaros));
-        fprintf('   Xsens channels - Mean: %.1f, Total: %d\n', mean(allXsens), sum(allXsens));
-        fprintf('   IMU channels - Mean: %.1f, Total: %d\n', mean(allIMU), sum(allIMU));
+        fprintf('\n📊 MERGE STATISTICS:\n');
+        fprintf('   Total channels added: %d\n', totalChannelsAdded);
+        fprintf('   Average channels per subject: %.1f\n', totalChannelsAdded / length(processedSubjects));
+        fprintf('   Total processing time: %.1f seconds (%.1f minutes)\n', totalTime, totalTime/60);
+        fprintf('   Average processing time: %.1f seconds per subject\n', totalTime / length(processedSubjects));
+        
+        % Data source statistics
+        allSources = {};
+        for i = 1:length(mergeStats)
+            sources = strsplit(mergeStats(i).data_sources_merged, ', ');
+            allSources = [allSources, sources];
+        end
+        uniqueSources = unique(allSources(~cellfun(@isempty, allSources)));
+        
+        fprintf('\n🔗 DATA SOURCES MERGED:\n');
+        for src = uniqueSources
+            count = sum(contains({mergeStats.data_sources_merged}, src{1}));
+            fprintf('   %s: %d subjects\n', src{1}, count);
+        end
     end
     
-    fprintf('\n💾 Output directory: %s\n', outputPath);
+    fprintf('\n💾 Output directory: %s\n', outPath);
     fprintf('==========================================================\n');
 end
 
 %% ==================== HELPER FUNCTIONS ====================
 
-function timestampCol = find_timestamp_column_imu(tableData)
-    % Find timestamp column in IMU data
-    possibleNames = {'timestamp_ns_', 'timestampns', 'timestamp [ns]', 'timestamp'};
-    timestampCol = '';
+function create_merge_plots(eeg, stats, subjectName, outputPath, savePlots, verbose)
+    % Create comprehensive plots showing the merged data quality
     
-    for i = 1:length(possibleNames)
-        if ismember(possibleNames{i}, tableData.Properties.VariableNames)
-            timestampCol = possibleNames{i};
-            break;
+    try
+        % Main figure with overview
+        fig1 = figure('Position', [100, 100, 1600, 1000], 'Name', sprintf('%s Merged Data Overview', subjectName));
+        
+        % Get channel types and organize data
+        channelTypes = {eeg.chanlocs.type};
+        channelLabels = {eeg.chanlocs.labels};
+        uniqueTypes = unique(channelTypes);
+        uniqueTypes = uniqueTypes(~cellfun(@isempty, uniqueTypes));
+        
+        timeVector = eeg.times / 1000; % Convert to seconds
+        
+        % Plot 1: Channel overview by type
+        subplot(2, 3, 1);
+        typeCounts = [];
+        for t = 1:length(uniqueTypes)
+            typeCounts(t) = sum(strcmp(channelTypes, uniqueTypes{t}));
         end
-    end
-    
-    % Try partial matching
-    if isempty(timestampCol)
-        for i = 1:length(possibleNames)
-            matches = contains(tableData.Properties.VariableNames, possibleNames{i}, 'IgnoreCase', true);
-            if any(matches)
-                idx = find(matches, 1);
-                timestampCol = tableData.Properties.VariableNames{idx};
-                break;
+        bar(typeCounts);
+        set(gca, 'XTickLabel', uniqueTypes, 'XTickLabelRotation', 45);
+        title('Channels by Type');
+        ylabel('Number of Channels');
+        grid on;
+        
+        % Plot 2-4: Show each data type
+        plotIdx = 2;
+        for t = 1:min(3, length(uniqueTypes))
+            subplot(2, 3, plotIdx);
+            
+            channelType = uniqueTypes{t};
+            typeIndices = find(strcmp(channelTypes, channelType));
+            
+            if ~isempty(typeIndices)
+                % Plot first few channels of this type
+                numToPlot = min(3, length(typeIndices));
+                colors = lines(numToPlot);
+                
+                for ch = 1:numToPlot
+                    chIdx = typeIndices(ch);
+                    data = eeg.data(chIdx, :);
+                    
+                    % Normalize and offset data for plotting
+                    if ~all(isnan(data))
+                        dataNorm = (data - nanmean(data)) / nanstd(data);
+                        plot(timeVector, dataNorm + (ch-1)*3, 'Color', colors(ch,:), 'LineWidth', 1);
+                        hold on;
+                    end
+                end
+                
+                title(sprintf('%s (%d channels)', channelType, length(typeIndices)));
+                xlabel('Time (seconds)');
+                ylabel('Normalized Amplitude');
+                grid on;
+                
+                % Add channel labels
+                if numToPlot <= 3
+                    legendLabels = {};
+                    for ch = 1:numToPlot
+                        chIdx = typeIndices(ch);
+                        legendLabels{ch} = eeg.chanlocs(chIdx).labels;
+                    end
+                    legend(legendLabels, 'Location', 'best', 'FontSize', 8);
+                end
+            end
+            plotIdx = plotIdx + 1;
+        end
+        
+        % Plot 5: Summary statistics
+        subplot(2, 3, 5);
+        axis off;
+        
+        summaryText = {
+            sprintf('MERGE SUMMARY: %s', subjectName),
+            '',
+            sprintf('Original channels: %d', stats.original_channels),
+            sprintf('Final channels: %d', stats.final_channels),
+            sprintf('Channels added: %d', stats.channels_added),
+            '',
+            'Data sources merged:',
+            sprintf('%s', stats.data_sources_merged),
+            '',
+            sprintf('Processing time: %.1fs', stats.processing_time_seconds),
+            '',
+            'Channel breakdown:'
+        };
+        
+        % Add channel type breakdown
+        for t = 1:length(uniqueTypes)
+            summaryText{end+1} = sprintf('  %s: %d channels', uniqueTypes{t}, typeCounts(t));
+        end
+        
+        text(0.1, 0.9, summaryText, 'Units', 'normalized', 'VerticalAlignment', 'top', ...
+             'FontSize', 9, 'FontWeight', 'normal');
+        
+        % Plot 6: Data coverage analysis
+        subplot(2, 3, 6);
+        coverageData = [];
+        coverageLabels = {};
+        
+        for t = 1:length(uniqueTypes)
+            typeIndices = find(strcmp(channelTypes, uniqueTypes{t}));
+            if ~isempty(typeIndices)
+                % Calculate average coverage for this type
+                totalCoverage = 0;
+                validChannels = 0;
+                
+                for ch = typeIndices
+                    data = eeg.data(ch, :);
+                    coverage = sum(~isnan(data)) / length(data) * 100;
+                    if ~isnan(coverage)
+                        totalCoverage = totalCoverage + coverage;
+                        validChannels = validChannels + 1;
+                    end
+                end
+                
+                if validChannels > 0
+                    avgCoverage = totalCoverage / validChannels;
+                    coverageData(end+1) = avgCoverage;
+                    coverageLabels{end+1} = uniqueTypes{t};
+                end
             end
         end
-    end
-end
-
-function colName = find_imu_column(colNames, targetName)
-    % Find IMU column with flexible matching
-    colName = '';
-    
-    % Try exact match first
-    if any(strcmp(colNames, targetName))
-        colName = targetName;
-        return;
-    end
-    
-    % Try partial matching
-    matches = contains(colNames, targetName, 'IgnoreCase', true);
-    if any(matches)
-        idx = find(matches, 1);
-        colName = colNames{idx};
-        return;
-    end
-    
-    % Try removing underscores and matching
-    targetClean = strrep(targetName, '_', '');
-    for i = 1:length(colNames)
-        colClean = strrep(colNames{i}, '_', '');
-        if contains(colClean, targetClean, 'IgnoreCase', true)
-            colName = colNames{i};
-            break;
+        
+        if ~isempty(coverageData)
+            bar(coverageData);
+            set(gca, 'XTickLabel', coverageLabels, 'XTickLabelRotation', 45);
+            title('Data Coverage by Type');
+            ylabel('Coverage (%)');
+            ylim([0, 100]);
+            grid on;
+        end
+        
+        sgtitle(sprintf('Merged Data Overview - %s', subjectName));
+        
+        if savePlots
+            plotPath = fullfile(outputPath, sprintf('%s_merged_overview.png', subjectName));
+            print(fig1, plotPath, '-dpng', '-r300');
+            if verbose
+                fprintf('      💾 Overview plot saved: %s\n', plotPath);
+            end
+        end
+        
+        % Create quality check plot (similar to user's example)
+        fig2 = figure('Position', [150, 150, 1400, 800], 'Name', sprintf('%s Merge Quality Check', subjectName));
+        
+        % Find specific channels to plot for quality check
+        ecgIdx = find(strcmp(channelTypes, 'ECG'), 1);
+        imuIdx = find(strcmp(channelTypes, 'IMU'), 1);
+        xsensIdx = find(strcmp(channelTypes, 'XSens'), 1);
+        gazeIdx = find(strcmp(channelTypes, 'Gaze'), 1);
+        
+        % Plot quality check data
+        subplot(2, 1, 1);
+        plotChannels = [];
+        plotLabels = {};
+        
+        if ~isempty(ecgIdx)
+            plot(eeg.data(ecgIdx, :), 'DisplayName', eeg.chanlocs(ecgIdx).labels);
+            hold on;
+            plotChannels(end+1) = ecgIdx;
+            plotLabels{end+1} = eeg.chanlocs(ecgIdx).labels;
+        end
+        
+        if ~isempty(imuIdx)
+            % Normalize IMU data for comparison
+            imuData = eeg.data(imuIdx, :);
+            imuNorm = (imuData - nanmean(imuData)) / nanstd(imuData) * nanstd(eeg.data(ecgIdx, :)) + nanmean(eeg.data(ecgIdx, :));
+            plot(imuNorm, 'DisplayName', eeg.chanlocs(imuIdx).labels);
+            plotChannels(end+1) = imuIdx;
+            plotLabels{end+1} = eeg.chanlocs(imuIdx).labels;
+        end
+        
+        if ~isempty(xsensIdx)
+            % Normalize XSens data for comparison
+            xsensData = eeg.data(xsensIdx, :);
+            xsensNorm = (xsensData - nanmean(xsensData)) / nanstd(xsensData) * nanstd(eeg.data(ecgIdx, :)) + nanmean(eeg.data(ecgIdx, :));
+            plot(xsensNorm, 'DisplayName', eeg.chanlocs(xsensIdx).labels);
+            plotChannels(end+1) = xsensIdx;
+            plotLabels{end+1} = eeg.chanlocs(xsensIdx).labels;
+        end
+        
+        % Find and plot events (similar to user's example)
+        if ~isempty(eeg.event)
+            % Find cloud events (if they exist)
+            cloudEvents = [];
+            if isfield(eeg.event, 'pupil_type')
+                cloudEvents = find(strcmpi({eeg.event.pupil_type}, 'cloud'));
+            end
+            
+            % If no cloud events, find any experimental events
+            if isempty(cloudEvents)
+                % Look for events that are not sync events
+                eventTypes = {eeg.event.type};
+                excludeTypes = {'lsl.time_sync', 'recording.begin', 'recording.end'};
+                eventMask = true(size(eventTypes));
+                for excl = excludeTypes
+                    eventMask = eventMask & ~contains(eventTypes, excl{1});
+                end
+                cloudEvents = find(eventMask);
+            end
+            
+            if ~isempty(cloudEvents) && length(cloudEvents) <= 50  % Limit to avoid clutter
+                latencies = [eeg.event(cloudEvents).latency];
+                types = {eeg.event(cloudEvents).type};
+                
+                % Get y-axis range for marker placement
+                ylims = ylim;
+                markerY = ylims(1) + 0.9 * (ylims(2) - ylims(1));
+                
+                % Plot markers at event latencies
+                plot(latencies, repmat(markerY, size(latencies)), ...
+                     'Marker', '+', 'LineStyle', 'none', 'MarkerSize', 15, ...
+                     'Color', 'red', 'LineWidth', 2);
+                
+                % Add text labels (sample first few to avoid clutter)
+                numLabels = min(10, length(latencies));
+                for i = 1:numLabels
+                    text(latencies(i), markerY * 1.05, types{i}, ...
+                         'Rotation', 45, 'FontSize', 8, 'HorizontalAlignment', 'left', ...
+                         'Color', 'red');
+                end
+                
+                if length(latencies) > numLabels
+                    text(latencies(end), markerY * 1.05, sprintf('...+%d more', length(latencies)-numLabels), ...
+                         'Rotation', 45, 'FontSize', 8, 'HorizontalAlignment', 'left', ...
+                         'Color', 'red');
+                end
+            end
+        end
+        
+        title(sprintf('Merged Data Quality Check - %s', subjectName));
+        xlabel('Sample Number');
+        ylabel('Amplitude');
+        legend(plotLabels, 'Location', 'best');
+        grid on;
+        hold off;
+        
+        % Plot event timeline
+        subplot(2, 1, 2);
+        if ~isempty(eeg.event)
+            % Create event timeline
+            eventTimes = [eeg.event.latency] / eeg.srate; % Convert to seconds
+            eventTypes = {eeg.event.type};
+            
+            % Get unique event types and assign colors
+            uniqueEventTypes = unique(eventTypes);
+            colors = lines(length(uniqueEventTypes));
+            
+            hold on;
+            for et = 1:length(uniqueEventTypes)
+                eventType = uniqueEventTypes{et};
+                eventMask = strcmp(eventTypes, eventType);
+                eventTimesType = eventTimes(eventMask);
+                
+                if length(eventTimesType) <= 100  % Avoid plotting too many events
+                    % Plot as stem plot
+                    stem(eventTimesType, repmat(et, size(eventTimesType)), ...
+                         'Color', colors(et, :), 'MarkerFaceColor', colors(et, :), ...
+                         'MarkerSize', 4, 'LineWidth', 1);
+                end
+            end
+            
+            % Set axis properties
+            xlim([0, max(timeVector)]);
+            ylim([0.5, length(uniqueEventTypes) + 0.5]);
+            set(gca, 'YTick', 1:length(uniqueEventTypes), 'YTickLabel', uniqueEventTypes);
+            title(sprintf('Event Timeline (%d events, %d types)', length(eeg.event), length(uniqueEventTypes)));
+            xlabel('Time (seconds)');
+            ylabel('Event Type');
+            grid on;
+            hold off;
+        else
+            text(0.5, 0.5, 'No events found', 'Units', 'normalized', 'HorizontalAlignment', 'center');
+            title('Event Timeline');
+        end
+        
+        if savePlots
+            plotPath = fullfile(outputPath, sprintf('%s_merge_quality.png', subjectName));
+            print(fig2, plotPath, '-dpng', '-r300');
+            if verbose
+                fprintf('      💾 Quality plot saved: %s\n', plotPath);
+            end
+        end
+        
+        if verbose
+            fprintf('      ✅ Merge quality plots created\n');
+        end
+        
+    catch ME
+        if verbose
+            fprintf('      ❌ Error creating merge plots: %s\n', ME.message);
         end
     end
 end
