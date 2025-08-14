@@ -566,12 +566,16 @@ for s = 1:length(subjectList)
                         
                         % Find foot position columns
                         footCols = {};
+                        toeCols = {};
                         varNames = segTable.Properties.VariableNames;
                         for v = 1:length(varNames)
                             varName = varNames{v};
                             if contains(varName, {'Foot'}, 'IgnoreCase', true) && ...
                                contains(varName, {'Z'}, 'IgnoreCase', true)
                                 footCols{end+1} = varName;
+                            elseif contains(varName, {'Toe'}, 'IgnoreCase', true) && ...
+                               contains(varName, {'Z'}, 'IgnoreCase', true)
+                                toeCols{end+1} = varName;
                             end
                         end
                         
@@ -602,6 +606,18 @@ for s = 1:length(subjectList)
                                 footInterp = interp1(xsensTimeAligned, footData, eegTimes, 'cubic', NaN);
                                 
                                 eeg.data(newChannelIdx, :) = footInterp;
+                                eeg.chanlocs(newChannelIdx).labels = colName;
+                                eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                newChannelIdx = newChannelIdx + 1;
+                                stats.channels_added = stats.channels_added + 1;
+                            end
+
+                            for f = 1:length(toeCols)
+                                colName = toeCols{f};
+                                toeData = segTable.(colName);
+                                toeInterp = interp1(xsensTimeAligned, toeData, eegTimes, 'cubic', NaN);
+                                
+                                eeg.data(newChannelIdx, :) = toeInterp;
                                 eeg.chanlocs(newChannelIdx).labels = colName;
                                 eeg.chanlocs(newChannelIdx).type = 'XSens';
                                 newChannelIdx = newChannelIdx + 1;

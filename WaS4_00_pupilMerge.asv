@@ -23,9 +23,9 @@ outputPath = '/Volumes/Work4TB/Seafile/WaS4/data/aligned/';  % Output directory 
 %% EEG-PUPIL LABS PREPROCESSING PIPELINE
 
 % Processing options
-processAllSubjects = false;  % Set to false to process specific subjects
-specificSubjects = [46];  % Only used if processAllSubjects = false
-overwriteExisting = false;  % Set to true to reprocess existing files
+processAllSubjects = true;  % Set to false to process specific subjects
+specificSubjects = [];  % Only used if processAllSubjects = false
+overwriteExisting = true;  % Set to true to reprocess existing files
 
 % Quality thresholds
 minSyncEvents = 2;  % Minimum number of sync events required (reduced to 2 for recording.begin/end)
@@ -1074,7 +1074,268 @@ for s = 1:length(subjectList)
         eeg = eeg_checkset(eeg);
         if verboseOutput, fprintf('   ✅ EEG structure updated: %d channels total\n\n', eeg.nbchan); end
         
-        %% Step 7: Create alignment plots
+        %% Step 7: Load and merge XSens .mat data
+        if verboseOutput, fprintf('🦴 Loading XSens .mat data...\n'); end
+        
+        % Look for XSens .mat file created by WaS4_01_xSensToMat.m
+        xsensMatFile = fullfile(subjectPath, sprintf('%s_xsens.mat', subjectFolder));
+        
+        if exist(xsensMatFile, 'file')
+            try
+                if verboseOutput, fprintf('   📥 Loading: %s\n', xsensMatFile); end
+                
+                xsensLoad = load(xsensMatFile);
+                xsensData = xsensLoad.xsensData;
+                
+                if verboseOutput
+                    fprintf('   ✅ XSens data loaded\n');
+                    fprintf('   📊 Available data types: %s\n', strjoin(fieldnames(xsensData), ', '));
+                end
+                
+                % Process Center of Mass data
+                if isfield(xsensData, 'center_of_mass') && ~isempty(xsensData.center_of_mass)
+                    if verboseOutput, fprintf('   🔄 Processing Center of Mass data...\n'); end
+                    
+                    for x = 1:length(xsensData.center_of_mass)
+                        if istable(xsensData.center_of_mass{x}) && height(xsensData.center_of_mass{x}) > 0
+                            comTable = xsensData.center_of_mass{x};
+                            
+                            % Get XSens frame rate (assume 60 Hz if not available)
+                            frameRate = 60;
+                            if isfield(xsensData, 'info') && length(xsensData.info) >= x
+                                try
+                                    if istable(xsensData.info{x}) && height(xsensData.info{x}) >= 5
+                                        frameRate = xsensData.info{x}{5,2};
+                                    end
+                                catch
+                                    frameRate = 60; % fallback
+                                end
+                            end
+                            
+                            % Create XSens time vector
+                            numFrames = height(comTable);
+                            xsensTimeLocal = (0:numFrames-1) / frameRate;
+                            
+                            % Simple linear interpolation to LSL time
+                            % Map first sample to EEG start, last sample to EEG end (or proportionally)
+                            xsensTimeStart = streams{1,};
+                            xsensTimeEnd = xsensTimeStart + (numFrames - 1) / frameRate;
+                            
+                            % Create LSL timestamps for XSens data
+                            xsensTimeLSL = linspace(xsensTimeStart, xsensTimeEnd, numFrames);
+                            
+                            % Find overlap with EEG recording
+                            timeBuffer = 1.0; % 1 second buffer
+                            overlapMask = (xsensTimeLSL >= (eegTimeStart - timeBuffer)) & ...
+                                         (xsensTimeLSL <= (eegTimeEnd + timeBuffer));
+                            
+                            if sum(overlapMask) > 10 % Need reasonable overlap
+                                % Extract overlapping data
+                                xsensTimesOverlap = xsensTimeLSL(overlapMask);
+                                
+                                % Add CoM position channels
+                                comCols = {'CoM_pos_x', 'CoM_pos_y', 'CoM_pos_z'};
+                                for c = 1:length(comCols)
+                                    colName = comCols{c};
+                                    if ismember(colName, comTable.Properties.VariableNames)
+                                        comData = comTable.(colName)(overlapMask);
+                                        
+                                        % Interpolate to EEG counter times
+                                        comInterp = interp1(xsensTimesOverlap, comData, counterXdfTimes, 'cubic', NaN);
+                                        
+                                        % Ensure interpolated data matches EEG sample count
+                                        if length(comInterp) ~= size(eeg.data, 2)
+                                            if verboseOutput
+                                                fprintf('   ⚠️ Size mismatch: EEG has %d samples, interpolated data has %d\n', ...
+                                                       size(eeg.data, 2), length(comInterp));
+                                            end
+                                            % Resize to match EEG data
+                                            if length(comInterp) > size(eeg.data, 2)
+                                                comInterp = comInterp(1:size(eeg.data, 2));
+                                            else
+                                                % Pad with NaN if too short
+                                                comInterp(end+1:size(eeg.data, 2)) = NaN;
+                                            end
+                                        end
+                                        
+                                        % Add to EEG structure
+                                        newChannelIdx = eeg.nbchan + 1;
+                                        eeg.data(newChannelIdx, :) = comInterp;
+                                        eeg.chanlocs(newChannelIdx).labels = sprintf('CoM_%s', colName);
+                                        eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                        eeg.nbchan = eeg.nbchan + 1;
+                                        channelsAdded = channelsAdded + 1;
+                                    end
+                                end
+                                
+                                % Add CoM velocity channels
+                                comVelCols = {'CoM_vel_x', 'CoM_vel_y', 'CoM_vel_z'};
+                                for c = 1:length(comVelCols)
+                                    colName = comVelCols{c};
+                                    if ismember(colName, comTable.Properties.VariableNames)
+                                        comVelData = comTable.(colName)(overlapMask);
+                                        
+                                        % Interpolate to EEG counter times
+                                        comVelInterp = interp1(xsensTimesOverlap, comVelData, counterXdfTimes, 'cubic', NaN);
+                                        
+                                        % Ensure interpolated data matches EEG sample count
+                                        if length(comVelInterp) ~= size(eeg.data, 2)
+                                            if length(comVelInterp) > size(eeg.data, 2)
+                                                comVelInterp = comVelInterp(1:size(eeg.data, 2));
+                                            else
+                                                comVelInterp(end+1:size(eeg.data, 2)) = NaN;
+                                            end
+                                        end
+                                        
+                                        % Add to EEG structure
+                                        newChannelIdx = eeg.nbchan + 1;
+                                        eeg.data(newChannelIdx, :) = comVelInterp;
+                                        eeg.chanlocs(newChannelIdx).labels = sprintf('CoM_%s', colName);
+                                        eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                        eeg.nbchan = eeg.nbchan + 1;
+                                        channelsAdded = channelsAdded + 1;
+                                    end
+                                end
+                                
+                                if verboseOutput
+                                    overlapPercent = sum(overlapMask) / numFrames * 100;
+                                    fprintf('   ✅ Added CoM channels (%.1f%% overlap, %d samples)\n', ...
+                                           overlapPercent, sum(overlapMask));
+                                end
+                            else
+                                if verboseOutput
+                                    fprintf('   ⚠️ Insufficient CoM data overlap with EEG\n');
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                % Process Foot Position data
+                if isfield(xsensData, 'segment_position') && ~isempty(xsensData.segment_position)
+                    if verboseOutput, fprintf('   🔄 Processing Foot Position data...\n'); end
+                    
+                    for x = 1:length(xsensData.segment_position)
+                        if istable(xsensData.segment_position{x}) && height(xsensData.segment_position{x}) > 0
+                            segTable = xsensData.segment_position{x};
+                            
+                            % Get frame rate
+                            frameRate = 60;
+                            if isfield(xsensData, 'info') && length(xsensData.info) >= x
+                                try
+                                    if istable(xsensData.info{x}) && height(xsensData.info{x}) >= 5
+                                        frameRate = xsensData.info{x}{5,2};
+                                    end
+                                catch
+                                    frameRate = 60;
+                                end
+                            end
+                            
+                            % Create time vector
+                            numFrames = height(segTable);
+                            xsensTimeStart = eegTimeStart;
+                            xsensTimeEnd = xsensTimeStart + (numFrames - 1) / frameRate;
+                            xsensTimeLSL = linspace(xsensTimeStart, xsensTimeEnd, numFrames);
+                            
+                            % Find overlap
+                            timeBuffer = 1.0;
+                            overlapMask = (xsensTimeLSL >= (eegTimeStart - timeBuffer)) & ...
+                                         (xsensTimeLSL <= (eegTimeEnd + timeBuffer));
+                            
+                            if sum(overlapMask) > 10
+                                xsensTimesOverlap = xsensTimeLSL(overlapMask);
+                                
+                                % Find foot and toe position columns
+                                varNames = segTable.Properties.VariableNames;
+                                footCols = {};
+                                toeCols = {};
+                                
+                                for v = 1:length(varNames)
+                                    varName = varNames{v};
+                                    if contains(varName, {'Foot'}, 'IgnoreCase', true) && ...
+                                       contains(varName, {'Z'}, 'IgnoreCase', true)
+                                        footCols{end+1} = varName;
+                                    elseif contains(varName, {'Toe'}, 'IgnoreCase', true) && ...
+                                           contains(varName, {'Z'}, 'IgnoreCase', true)
+                                        toeCols{end+1} = varName;
+                                    end
+                                end
+                                
+                                % Add foot position channels
+                                for f = 1:length(footCols)
+                                    colName = footCols{f};
+                                    footData = segTable.(colName)(overlapMask);
+                                    
+                                    % Interpolate to EEG counter times
+                                    footInterp = interp1(xsensTimesOverlap, footData, counterXdfTimes, 'cubic', NaN);
+                                    
+                                    % Ensure interpolated data matches EEG sample count
+                                    if length(footInterp) ~= size(eeg.data, 2)
+                                        if length(footInterp) > size(eeg.data, 2)
+                                            footInterp = footInterp(1:size(eeg.data, 2));
+                                        else
+                                            footInterp(end+1:size(eeg.data, 2)) = NaN;
+                                        end
+                                    end
+                                    
+                                    % Add to EEG structure
+                                    newChannelIdx = eeg.nbchan + 1;
+                                    eeg.data(newChannelIdx, :) = footInterp;
+                                    eeg.chanlocs(newChannelIdx).labels = colName;
+                                    eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                    eeg.nbchan = eeg.nbchan + 1;
+                                    channelsAdded = channelsAdded + 1;
+                                end
+                                
+                                % Add toe position channels
+                                for t = 1:length(toeCols)
+                                    colName = toeCols{t};
+                                    toeData = segTable.(colName)(overlapMask);
+                                    
+                                    % Interpolate to EEG counter times
+                                    toeInterp = interp1(xsensTimesOverlap, toeData, counterXdfTimes, 'cubic', NaN);
+                                    
+                                    % Ensure interpolated data matches EEG sample count
+                                    if length(toeInterp) ~= size(eeg.data, 2)
+                                        if length(toeInterp) > size(eeg.data, 2)
+                                            toeInterp = toeInterp(1:size(eeg.data, 2));
+                                        else
+                                            toeInterp(end+1:size(eeg.data, 2)) = NaN;
+                                        end
+                                    end
+                                    
+                                    % Add to EEG structure
+                                    newChannelIdx = eeg.nbchan + 1;
+                                    eeg.data(newChannelIdx, :) = toeInterp;
+                                    eeg.chanlocs(newChannelIdx).labels = colName;
+                                    eeg.chanlocs(newChannelIdx).type = 'XSens';
+                                    eeg.nbchan = eeg.nbchan + 1;
+                                    channelsAdded = channelsAdded + 1;
+                                end
+                                
+                                if verboseOutput && (~isempty(footCols) || ~isempty(toeCols))
+                                    overlapPercent = sum(overlapMask) / numFrames * 100;
+                                    fprintf('   ✅ Added %d foot/toe channels (%.1f%% overlap)\n', ...
+                                           length(footCols) + length(toeCols), overlapPercent);
+                                end
+                            end
+                        end
+                    end
+                end
+                
+            catch ME
+                if verboseOutput
+                    fprintf('   ❌ Error loading XSens data: %s\n', ME.message);
+                end
+            end
+        else
+            if verboseOutput
+                fprintf('   ⚠️ XSens .mat file not found: %s\n', xsensMatFile);
+                fprintf('   💡 Run WaS4_01_xSensToMat.m first to convert XSens data\n');
+            end
+        end
+        
+        %% Step 8: Create alignment plots
         if createPlots
             if verboseOutput, fprintf('📈 Creating alignment plots...\n'); end
             
@@ -1339,7 +1600,7 @@ for s = 1:length(subjectList)
         % re-order events
         eeg = eeg_checkset(eeg,'eventconsistency');
         
-        %% Step 8: Save results
+        %% Step 9: Save results
         if saveResults
             if verboseOutput, fprintf('💾 Saving results...\n'); end
             

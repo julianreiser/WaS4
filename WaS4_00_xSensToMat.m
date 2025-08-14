@@ -20,12 +20,27 @@ dataPath = '/Volumes/ergo/rohdaten/RohDaten_GRAIL/WaS4/DATA/';  % Main data dire
 
 % Processing options
 processAllSubjects = true;  % Set to false to process specific subjects
-specificSubjects = [1];     % Only used if processAllSubjects = false
-overwriteExisting = false;   % Set to true to reprocess existing .mat files
+specificSubjects = [];     % Only used if processAllSubjects = false
+overwriteExisting = true;   % Set to true to reprocess existing .mat files
 
 % Xsens file configuration
-xsensSheets = {'General Information', 'Center of Mass', 'Segment Position', 'Joint Angles ZXY'};
-xsensVarNames = {'info', 'center_of_mass', 'segment_position', 'joint_angles'};
+% Xsens file configuration
+xsensSheets = {
+    'General Information', 
+    'Center of Mass', 
+    'Segment Position', 
+    'Joint Angles ZXY',
+    'Segment Orientation - Quat',     % Quaternion data for gait detection
+    'Segment Orientation - Euler'     % Euler angle data for gait detection
+};
+xsensVarNames = {
+    'info', 
+    'center_of_mass', 
+    'segment_position', 
+    'joint_angles',
+    'segment_orientation_quat',       % Quaternion data for gait detection
+    'segment_orientation_euler'       % Euler angle data for gait detection
+};
 
 % Output options
 verboseOutput = true;
@@ -92,7 +107,9 @@ sheetsToProcess = {
     'General Information',
     'Center of Mass', 
     'Segment Position',
-    'Joint Angles ZXY'
+    'Joint Angles ZXY',
+    'Segment Orientation - Quat',
+    'Segment Orientation - Euler'
 };
 
 % Initialize tracking variables
@@ -227,6 +244,10 @@ for s = 1:length(subjectList)
                             varName = 'segment_position';
                         case 'joint angles zxy'
                             varName = 'joint_angles';
+                        case 'segment orientation - quat'
+                            varName = 'segment_orientation_quat';
+                        case 'segment orientation - euler'
+                            varName = 'segment_orientation_euler';
                         otherwise
                             varName = matlab.lang.makeValidName(lower(strrep(sheetName, ' ', '_')));
                     end
@@ -269,6 +290,40 @@ for s = 1:length(subjectList)
         conversionInfo.matlab_version = version;
         conversionInfo.script_name = mfilename;
         
+        % Validate required data for gait detection
+        requiredFields = {'segment_orientation_quat', 'segment_orientation_euler'};
+        missingFields = [];
+
+        for f = 1:length(requiredFields)
+            if ~isfield(xsensData, requiredFields{f}) || isempty(xsensData.(requiredFields{f}))
+                missingFields{end+1} = requiredFields{f};
+            end
+        end
+
+        if ~isempty(missingFields)
+            warning('Missing required data for gait detection: %s', strjoin(missingFields, ', '));
+            
+            % Add empty placeholder if data is missing
+            for f = 1:length(missingFields)
+                if ~isfield(xsensData, missingFields{f})
+                    xsensData.(missingFields{f}) = {};
+                end
+            end
+        end
+
+        % Add sampling rate information if available
+        if ~isempty(xsensData.info)
+            try
+                infoTable = xsensData.info{1};
+                frameRateRow = contains(infoTable.Parameter, 'Frame Rate', 'IgnoreCase', true);
+                if any(frameRateRow)
+                    xsensData.sampling_rate = str2double(infoTable.Value{frameRateRow});
+                end
+            catch
+                warning('Could not extract sampling rate from info sheet');
+            end
+        end
+
         % Save with compression for large files
         save(outputFile, 'xsensData', 'conversionInfo', '-v7.3');
         
@@ -727,10 +782,83 @@ function colNames = get_xsens_column_names(sheetName, numCols)
                     if length(colNames) >= numCols, break; end
                 end
             end
+
+        case 'angular kinematics'
+            colNames = {'Frame', 'Time'};
+            segmentNames = {
+                'Pelvis', 'L5', 'L3', 'T12', 'T8', 'Neck', 'Head', ...
+                'RightShoulder', 'RightUpperArm', 'RightForearm', 'RightHand', ...
+                'LeftShoulder', 'LeftUpperArm', 'LeftForearm', 'LeftHand', ...
+                'RightUpperLeg', 'RightLowerLeg', 'RightFoot', 'RightToe', ...
+                'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot', 'LeftToe'
+            };
             
+            for seg = 1:length(segmentNames)
+                if length(colNames) >= numCols, break; end
+                for coord = {'AngVel_X', 'AngVel_Y', 'AngVel_Z', 'AngAcc_X', 'AngAcc_Y', 'AngAcc_Z'}
+                    colNames{end+1} = sprintf('%s_%s', segmentNames{seg}, coord{1});
+                    if length(colNames) >= numCols, break; end
+                end
+            end
+            
+        case 'segment kinematics'
+            colNames = {'Frame', 'Time'};
+            segmentNames = {
+                'Pelvis', 'L5', 'L3', 'T12', 'T8', 'Neck', 'Head', ...
+                'RightShoulder', 'RightUpperArm', 'RightForearm', 'RightHand', ...
+                'LeftShoulder', 'LeftUpperArm', 'LeftForearm', 'LeftHand', ...
+                'RightUpperLeg', 'RightLowerLeg', 'RightFoot', 'RightToe', ...
+                'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot', 'LeftToe'
+            };
+            
+            for seg = 1:length(segmentNames)
+                if length(colNames) >= numCols, break; end
+                for metric = {'Acc_X', 'Acc_Y', 'Acc_Z', 'Vel_X', 'Vel_Y', 'Vel_Z'}
+                    colNames{end+1} = sprintf('%s_%s', segmentNames{seg}, metric{1});
+                    if length(colNames) >= numCols, break; end
+                end
+            end
+
+        case 'segment orientation - quat'
+            colNames = {'Frame', 'Time'};
+            segmentNames = {
+                'Pelvis', 'L5', 'L3', 'T12', 'T8', 'Neck', 'Head', ...
+                'RightShoulder', 'RightUpperArm', 'RightForearm', 'RightHand', ...
+                'LeftShoulder', 'LeftUpperArm', 'LeftForearm', 'LeftHand', ...
+                'RightUpperLeg', 'RightLowerLeg', 'RightFoot', 'RightToe', ...
+                'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot', 'LeftToe'
+            };
+            
+            for seg = 1:length(segmentNames)
+                if length(colNames) >= numCols, break; end
+                for quat = {'q0', 'q1', 'q2', 'q3'}
+                    colNames{end+1} = sprintf('%s_%s', segmentNames{seg}, quat{1});
+                    if length(colNames) >= numCols, break; end
+                end
+            end
+
+        case 'segment orientation - euler'
+            colNames = {'Frame', 'Time'};
+            segmentNames = {
+                'Pelvis', 'L5', 'L3', 'T12', 'T8', 'Neck', 'Head', ...
+                'RightShoulder', 'RightUpperArm', 'RightForearm', 'RightHand', ...
+                'LeftShoulder', 'LeftUpperArm', 'LeftForearm', 'LeftHand', ...
+                'RightUpperLeg', 'RightLowerLeg', 'RightFoot', 'RightToe', ...
+                'LeftUpperLeg', 'LeftLowerLeg', 'LeftFoot', 'LeftToe'
+            };
+            
+            for seg = 1:length(segmentNames)
+                if length(colNames) >= numCols, break; end
+                for angle = {'X', 'Y', 'Z'}
+                    colNames{end+1} = sprintf('%s_%s', segmentNames{seg}, angle{1});
+                    if length(colNames) >= numCols, break; end
+                end
+            end
+
         otherwise
             % Generic column names as fallback
             colNames = arrayfun(@(x) sprintf('Var%d', x), 1:numCols, 'UniformOutput', false);
+
     end
     
     % Ensure we have exactly the right number of columns
