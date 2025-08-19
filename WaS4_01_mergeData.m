@@ -23,8 +23,8 @@ outputPath = '/Volumes/Work4TB/Seafile/WaS4/data/aligned/';  % Output directory 
 
 % Processing options
 processAllSubjects = true;  % Set to false to process specific subjects
-specificSubjects = [1];  % Only used if processAllSubjects = false
-overwriteExisting = true;  % Set to true to reprocess existing files
+specificSubjects = [];  % Only used if processAllSubjects = false
+overwriteExisting = false;  % Set to true to reprocess existing files
 
 % Quality thresholds
 minSyncEvents = 2;  % Minimum number of sync events required (reduced to 2 for recording.begin/end)
@@ -106,7 +106,7 @@ for s = 1:length(subjectList)
     
     try
         % Check if already processed
-        outputFile = fullfile(outputPath, sprintf('%s_aligned.set', subjectFolder));
+        outputFile = fullfile(outputPath, sprintf('%s_merged.set', subjectFolder));
         if exist(outputFile, 'file') && ~overwriteExisting
             if verboseOutput
                 fprintf('⏭️  Already processed (use overwriteExisting=true to reprocess)\n\n');
@@ -128,7 +128,7 @@ for s = 1:length(subjectList)
         
         % Call WaS4_merge to get all synchronized data
         if verboseOutput, fprintf('   🔄 Processing subject %03d with WaS4_merge...\n', subjectNum); end
-        [eeg, streamsMerged] = WaS4_merge(subjectNum, dataPath);
+        [eeg, streamsMerged] = WaS4_merge(subjectNum, dataPath, outputPath);
         
         if verboseOutput
             fprintf('   ✅ WaS4_merge completed successfully\n');

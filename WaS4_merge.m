@@ -205,10 +205,24 @@ plEventData = [];
 for f = 1:length(plDirs)
     % import gaze and fixation data
     disp(['reading gaze data from ' fullfile(dataPath, subjectFolder, plDirs{f}) '...'])
+    
+    pupilFolderPath = fullfile(dataPath, subjectFolder, plDirs{f});
+    timeAlignedGazeFile = fullfile(pupilFolderPath, 'time_aligned_gaze.csv');
+    
+    % Check if time_aligned_gaze.csv exists, if not, create it
+    if ~exist(timeAlignedGazeFile, 'file')
+        fprintf('⚠️  time_aligned_gaze.csv not found, attempting to create it...\n');
+        success = create_time_aligned_gaze(pupilFolderPath);
+        if ~success
+            warning(['Could not create time-aligned gaze data for folder: ' pupilFolderPath]);
+            continue; % Skip this folder
+        end
+    end
+    
     try
-        newGaze = importGaze(fullfile(dataPath, subjectFolder, plDirs{f}, 'time_aligned_gaze.csv'));
-        newFix = importFixations(fullfile(dataPath, subjectFolder, plDirs{f}, 'fixations.csv'));
-        newEvent = readtable(fullfile(dataPath, subjectFolder, plDirs{f}, 'events.csv'));
+        newGaze = importGaze(timeAlignedGazeFile);
+        newFix = importFixations(fullfile(pupilFolderPath, 'fixations.csv'));
+        newEvent = readtable(fullfile(pupilFolderPath, 'events.csv'));
     catch ex
         warning(['missing files in folder:' newline ex.message]);
         return
@@ -240,7 +254,12 @@ beg = [];
 ending = [];
 for g = 1:length(gapIdx)-1
     nextBeg = find(amp.data(cntIdx,:) == streams{eegIdx}.time_series(gapIdx(g)+1));
-    nextEnding = find(amp.data(cntIdx,:) == streams{eegIdx}.time_series(gapIdx(g+1)));
+    if ~isempty(find(amp.data(cntIdx,:) == streams{eegIdx}.time_series(gapIdx(g+1))))
+        nextEnding = find(amp.data(cntIdx,:) == streams{eegIdx}.time_series(gapIdx(g+1)));
+    % if there is no simple solution, go for this one
+    else possibleEnds = find(amp.data(cntIdx,:) ~= 0);
+        nextEnding = possibleEnds(end);
+    end
 
     beg = [beg nextBeg];
     ending = [ending nextEnding];
@@ -261,50 +280,98 @@ disp('--- replaced EEG data ---');
 farosECGIdx = cellfun(@(x) contains(x.info.name, 'faros_ecg', 'IgnoreCase', true), streamsMerged);
 farosACCIdx = cellfun(@(x) contains(x.info.name, 'faros_acc', 'IgnoreCase', true), streamsMerged);
 
-% resample lsl data to faros sampling rate
+% resample lsl data to faros sampling rate - only if streams have data
 for id = 1:2
     if id == 1
         farosIdx = farosECGIdx;
+        streamName = 'ECG';
     elseif id == 2
         farosIdx = farosACCIdx;
+        streamName = 'ACC';
     end
 
-    lslFaros = streams{farosIdx};
-    newLSLTime = lslFaros.time_stamps(1):ecgSampRate:lslFaros.time_stamps(end);
-    newLSLData = [];
-    for ch = 1:size(lslFaros.time_series, 1)
-        newChData = interp1(lslFaros.time_stamps, double(lslFaros.time_series(ch,:)), newLSLTime, 'pchip');
-        newLSLData = [newLSLData; newChData];
+    if any(farosIdx)
+        lslFaros = streams{farosIdx};
+        
+        % Check if stream has actual data
+        if isempty(lslFaros.time_series) || isempty(lslFaros.time_stamps)
+            fprintf('⚠️  Faros %s stream found but empty - skipping resampling\n', streamName);
+            continue;
+        end
+        
+        if length(lslFaros.time_stamps) < 2
+            fprintf('⚠️  Faros %s stream has insufficient data points (%d) - skipping resampling\n', streamName, length(lslFaros.time_stamps));
+            continue;
+        end
+        
+        fprintf('✅ Resampling Faros %s stream (%d samples)\n', streamName, size(lslFaros.time_series, 2));
+        
+        newLSLTime = lslFaros.time_stamps(1):ecgSampRate:lslFaros.time_stamps(end);
+        newLSLData = [];
+        for ch = 1:size(lslFaros.time_series, 1)
+            newChData = interp1(lslFaros.time_stamps, double(lslFaros.time_series(ch,:)), newLSLTime, 'pchip');
+            newLSLData = [newLSLData; newChData];
+        end
+        streamsMerged{farosIdx}.time_stamps = newLSLTime;
+        streamsMerged{farosIdx}.time_series = newLSLData;
+    else
+        fprintf('ℹ️  No Faros %s stream found - continuing without ECG data\n', streamName);
     end
-    streamsMerged{farosIdx}.time_stamps = newLSLTime;
-    streamsMerged{farosIdx}.time_series = newLSLData;
 end
+% Process Faros data files only if ECG stream has data
 fDataMerged = [];
-for f = 1:length(farosData)
-    fData = farosData{f};
+if any(farosECGIdx) && ~isempty(streamsMerged{farosECGIdx}.time_series) && ~isempty(farosData)
+    fprintf('🔗 Processing %d Faros data files for alignment\n', length(farosData));
+    
+    for f = 1:length(farosData)
+        fData = farosData{f};
 
-    % align data from faros and lsl through cross correlation
-    [r,lags] = xcorr(streamsMerged{farosECGIdx}.time_series, fData(:,2));
-    [~, maxIdx] = max(r(lags >= 0));
-    maxIdx = maxIdx + find(lags == 0);
-    offset = lags(maxIdx);
-    offsetTime = offset*ecgSampRate;
+        % align data from faros and lsl through cross correlation
+        try
+            [r,lags] = xcorr(streamsMerged{farosECGIdx}.time_series, fData(:,2));
+            [~, maxIdx] = max(r(lags >= 0));
+            maxIdx = maxIdx + find(lags == 0);
+            offset = lags(maxIdx);
+            offsetTime = offset*ecgSampRate;
 
-    fData(:,1) = fData(:,1) + streamsMerged{farosECGIdx}.time_stamps(1) + offsetTime;
+            fData(:,1) = fData(:,1) + streamsMerged{farosECGIdx}.time_stamps(1) + offsetTime;
 
-    fDataMerged = [fDataMerged; fData];
+            fDataMerged = [fDataMerged; fData];
+        catch ME
+            fprintf('⚠️  Cross-correlation failed for Faros file %d: %s\n', f, ME.message);
+            % Continue with raw timestamps if cross-correlation fails
+            fDataMerged = [fDataMerged; fData];
+        end
+    end
+
+    % replace ecg - only if we have valid ECG stream
+    if any(farosECGIdx) && ~isempty(streamsMerged{farosECGIdx}.time_stamps) && ~isempty(fDataMerged)
+        idx = find(fDataMerged(:,1) >= streamsMerged{farosECGIdx}.time_stamps(1) & fDataMerged(:,1) <= streamsMerged{farosECGIdx}.time_stamps(end));
+        if ~isempty(idx)
+            streamsMerged{farosECGIdx}.time_stamps = fDataMerged(idx,1)';
+            streamsMerged{farosECGIdx}.time_series = fDataMerged(idx,2)';
+            fprintf('✅ Replaced ECG data with %d aligned samples\n', length(idx));
+        else
+            fprintf('⚠️  No overlapping time range found for ECG replacement\n');
+        end
+    end
+
+    % replace acc - only if we have valid ACC stream
+    if any(farosACCIdx) && ~isempty(streamsMerged{farosACCIdx}.time_stamps) && ~isempty(fDataMerged)
+        idx = find(fDataMerged(:,1) >= streamsMerged{farosACCIdx}.time_stamps(1) & fDataMerged(:,1) <= streamsMerged{farosACCIdx}.time_stamps(end));
+        if ~isempty(idx) && size(fDataMerged, 2) >= 5
+            streamsMerged{farosACCIdx}.time_stamps = fDataMerged(idx,1)';
+            streamsMerged{farosACCIdx}.time_series = fDataMerged(idx,3:5)';
+            fprintf('✅ Replaced ACC data with %d aligned samples\n', length(idx));
+        else
+            fprintf('⚠️  No overlapping time range or insufficient columns for ACC replacement\n');
+        end
+    end
+    
+    disp('--- ECG processing complete ---');
+else
+    fprintf('ℹ️  Skipping Faros data processing (no ECG stream or no Faros files)\n');
 end
-
-% replace ecg
-idx = find(fDataMerged(:,1) >= streamsMerged{farosECGIdx}.time_stamps(1) & fDataMerged(:,1) <= streamsMerged{farosECGIdx}.time_stamps(end));
-streamsMerged{farosECGIdx}.time_stamps = fDataMerged(idx,1)';
-streamsMerged{farosECGIdx}.time_series = fDataMerged(idx,2)';
-
-% replace acc
-idx = find(fDataMerged(:,1) >= streamsMerged{farosACCIdx}.time_stamps(1) & fDataMerged(:,1) <= streamsMerged{farosACCIdx}.time_stamps(end));
-streamsMerged{farosACCIdx}.time_stamps = fDataMerged(idx,1)';
-streamsMerged{farosACCIdx}.time_series = fDataMerged(idx,3:5)';
-disp('--- replaced ECG data ---');
 
 
 %% gaze
@@ -313,83 +380,137 @@ disp('--- replaced ECG data ---');
 plGazeIdx = cellfun(@(x) contains(x.info.name, 'pupil_labs_Gaze', 'IgnoreCase', true), streamsMerged);
 plEventIdx = cellfun(@(x) contains(x.info.name, 'pupil_labs_Event', 'IgnoreCase', true), streamsMerged);
 
-% add lsl times to fixations
-plFixData.lsl_times = zeros(size(plFixData,1),1);
+% Check if we have Pupil Labs data available
+hasPupilGaze = any(plGazeIdx) && ~isempty(streamsMerged{plGazeIdx}.time_stamps);
+hasPupilEvents = any(plEventIdx) && ~isempty(streamsMerged{plEventIdx}.time_stamps);
+hasPupilCSV = exist('plGazeData', 'var') && exist('plFixData', 'var') && exist('plEventData', 'var');
 
-for i = 1:size(plFixData,1)
-    fixNum = plFixData.fixationId(i);
-    fixId = find(plGazeData.fixationId == fixNum);
-    fixId = fixId(1); % use start of fixation
-    plFixData.lsl_times(i) = plGazeData.lsl_times(fixId);
-end
+if hasPupilCSV && hasPupilGaze
+    fprintf('🔗 Processing Pupil Labs data integration\n');
+    
+    % add lsl times to fixations
+    if size(plFixData, 1) > 0
+        plFixData.lsl_times = zeros(size(plFixData,1),1);
 
-% add lsl times to events
-plEventData.lsl_times = zeros(size(plEventData,1),1);
+        for i = 1:size(plFixData,1)
+            fixNum = plFixData.fixationId(i);
+            fixId = find(plGazeData.fixationId == fixNum);
+            if ~isempty(fixId)
+                fixId = fixId(1); % use start of fixation
+                plFixData.lsl_times(i) = plGazeData.lsl_times(fixId);
+            end
+        end
+        fprintf('✅ Added LSL times to %d fixations\n', size(plFixData,1));
+    else
+        fprintf('ℹ️  No fixation data available\n');
+    end
 
-% add known event times from LSL data
-for e = 1:length(streamsMerged{plEventIdx}.time_stamps)
-    idx = find(strcmp(plEventData.name, streamsMerged{plEventIdx}.time_series(e)));
-    if ~isempty(idx)
-        plEventData.lsl_times(idx) = streamsMerged{plEventIdx}.time_stamps(e);
+    % add lsl times to events
+    if size(plEventData, 1) > 0 && hasPupilEvents
+        plEventData.lsl_times = zeros(size(plEventData,1),1);
+
+        % add known event times from LSL data
+        for e = 1:length(streamsMerged{plEventIdx}.time_stamps)
+            idx = find(strcmp(plEventData.name, streamsMerged{plEventIdx}.time_series(e)));
+            if ~isempty(idx)
+                plEventData.lsl_times(idx) = streamsMerged{plEventIdx}.time_stamps(e);
+            end
+        end
+
+        % calculate times for remaining events from nearest sync point
+        for e = 1:size(plEventData,1)
+            if plEventData.lsl_times(e) == 0
+                idx = find(plEventData.lsl_times ~= 0);
+                if ~isempty(idx)
+                    [~,refIdx] = min(abs(idx - e));
+                    plEventData.lsl_times(e) = plEventData.lsl_times(idx(refIdx)) + (plEventData.timestamp_ns_(e) - plEventData.timestamp_ns_(idx(refIdx)))/10^9;
+                end
+            end
+        end
+        fprintf('✅ Added LSL times to %d events\n', size(plEventData,1));
+    else
+        fprintf('ℹ️  No event data available or no event stream\n');
+    end
+
+    % replace lsl data with pupil cloud data if we have valid gaze data
+    if size(plGazeData, 1) > 0
+        % gaze:
+        gazeIdx = find(plGazeData.lsl_times >= streamsMerged{plGazeIdx}.time_stamps(1) & plGazeData.lsl_times <= streamsMerged{plGazeIdx}.time_stamps(end));
+        
+        if ~isempty(gazeIdx)
+            gazeDataNew = plGazeData(gazeIdx,:);
+            streamsMerged{plGazeIdx}.time_stamps = gazeDataNew.lsl_times';
+            streamsMerged{plGazeIdx}.time_series = [gazeDataNew.gazeXpx, gazeDataNew.gazeYpx, gazeDataNew.fixationId, gazeDataNew.blinkId, gazeDataNew.azimuthdeg, gazeDataNew.elevationdeg]';
+
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{3}.label = 'fixationId';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{3}.eye = 'both';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{4}.label = 'blinkId';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{4}.eye = 'both';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{5}.label = 'azimuthdeg';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{5}.eye = 'both';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{6}.label = 'elevationdeg';
+            streamsMerged{plGazeIdx}.info.desc.channels.channel{6}.eye = 'both';
+            
+            fprintf('✅ Replaced gaze data with %d samples from CSV\n', length(gazeIdx));
+        else
+            fprintf('⚠️  No overlapping gaze data found\n');
+        end
+
+        % fixations (new channel):
+        if size(plFixData, 1) > 0 && any(isfield(plFixData, 'lsl_times')) && any(plFixData.lsl_times > 0)
+            fixIdx = find(plFixData.lsl_times >= streamsMerged{plGazeIdx}.time_stamps(1) & plFixData.lsl_times <= streamsMerged{plGazeIdx}.time_stamps(end));
+            
+            if ~isempty(fixIdx)
+                fixDataNew = plFixData(fixIdx,:);
+                plFixIdx = length(streamsMerged) + 1;
+                streamsMerged{plFixIdx}.time_stamps = fixDataNew.lsl_times';
+                streamsMerged{plFixIdx}.time_series = [fixDataNew.fixationId, fixDataNew.durationms, fixDataNew.fixationXpx, fixDataNew.fixationYpx, fixDataNew.azimuthdeg, fixDataNew.elevationdeg]';
+                fprintf('✅ Added fixation stream with %d samples\n', length(fixIdx));
+            else
+                fprintf('ℹ️  No overlapping fixation data found\n');
+            end
+        else
+            fprintf('ℹ️  No valid fixation data to add\n');
+        end
+    else
+        fprintf('ℹ️  No gaze data available\n');
+    end
+    
+        % Add fixation stream metadata if it was created
+        if exist('plFixIdx', 'var')
+            streamsMerged{plFixIdx}.info.name = 'pupil_labs_Fixations';
+            streamsMerged{plFixIdx}.info.type = 'fixations';
+            streamsMerged{plFixIdx}.info.channel_count = '6';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{1}.label = 'fixationId';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{1}.eye = 'both';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{2}.label = 'durationMs';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{2}.eye = 'both';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{3}.label = 'fixationX';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{3}.eye = 'both';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{4}.label = 'fixationY';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{4}.eye = 'both';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{5}.label = 'azimuthDeg';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{5}.eye = 'both';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{6}.label = 'elevationDeg';
+            streamsMerged{plFixIdx}.info.desc.channels.channel{6}.eye = 'both';
+        end
+
+        % Update events if we have event data
+        if hasPupilEvents && size(plEventData, 1) > 0
+            streamsMerged{plEventIdx}.time_stamps = plEventData.lsl_times';
+            streamsMerged{plEventIdx}.time_series = horzcat(plEventData.name, plEventData.type)';
+            streamsMerged{plEventIdx}.info.channel_count = '2';
+            fprintf('✅ Updated event stream with %d events\n', size(plEventData, 1));
+        end
+    
+    disp('--- Pupil Labs processing complete ---');
+else
+    if ~hasPupilCSV
+        fprintf('ℹ️  No Pupil Labs CSV data found - skipping Pupil integration\n');
+    elseif ~hasPupilGaze
+        fprintf('ℹ️  No Pupil Labs LSL stream found - skipping Pupil integration\n');
     end
 end
-
-% calculate times for remaining events from nearest sync point
-for e = 1:size(plEventData,1)
-    if plEventData.lsl_times(e) == 0
-        idx = find(plEventData.lsl_times ~= 0);
-        [~,refIdx] = min(abs(idx - e));
-        plEventData.lsl_times(e) = plEventData.lsl_times(idx(refIdx)) + (plEventData.timestamp_ns_(e) - plEventData.timestamp_ns_(idx(refIdx)))/10^9;
-    end
-end
-
-% replace lsl data with pupil cloud data
-
-% gaze:
-gazeIdx = find(plGazeData.lsl_times >= streamsMerged{plGazeIdx}.time_stamps(1) & plGazeData.lsl_times <= streamsMerged{plGazeIdx}.time_stamps(end));
-gazeDataNew = plGazeData(gazeIdx,:);
-streamsMerged{plGazeIdx}.time_stamps = gazeDataNew.lsl_times';
-streamsMerged{plGazeIdx}.time_series = [gazeDataNew.gazeXpx, gazeDataNew.gazeYpx, gazeDataNew.fixationId, gazeDataNew.blinkId, gazeDataNew.azimuthdeg, gazeDataNew.elevationdeg]';
-
-streamsMerged{plGazeIdx}.info.desc.channels.channel{3}.label = 'fixationId';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{3}.eye = 'both';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{4}.label = 'blinkId';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{4}.eye = 'both';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{5}.label = 'azimuthdeg';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{5}.eye = 'both';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{6}.label = 'elevationdeg';
-streamsMerged{plGazeIdx}.info.desc.channels.channel{6}.eye = 'both';
-
-% fixations (new channel):
-fixIdx = find(plFixData.lsl_times >= streamsMerged{plGazeIdx}.time_stamps(1) & plFixData.lsl_times <= streamsMerged{plGazeIdx}.time_stamps(end));
-fixDataNew = plFixData(fixIdx,:);
-plFixIdx = length(streamsMerged) + 1;
-streamsMerged{plFixIdx}.time_stamps = fixDataNew.lsl_times';
-streamsMerged{plFixIdx}.time_series = [fixDataNew.fixationId, fixDataNew.durationms, fixDataNew.fixationXpx, fixDataNew.fixationYpx, fixDataNew.azimuthdeg, fixDataNew.elevationdeg]';
-
-streamsMerged{plFixIdx}.info.name = 'pupil_labs_Fixations';
-streamsMerged{plFixIdx}.info.type = 'fixations';
-streamsMerged{plFixIdx}.info.channel_count = '6';
-streamsMerged{plFixIdx}.info.desc.channels.channel{1}.label = 'fixationId';
-streamsMerged{plFixIdx}.info.desc.channels.channel{1}.eye = 'both';
-streamsMerged{plFixIdx}.info.desc.channels.channel{2}.label = 'durationMs';
-streamsMerged{plFixIdx}.info.desc.channels.channel{2}.eye = 'both';
-streamsMerged{plFixIdx}.info.desc.channels.channel{3}.label = 'fixationX';
-streamsMerged{plFixIdx}.info.desc.channels.channel{3}.eye = 'both';
-streamsMerged{plFixIdx}.info.desc.channels.channel{4}.label = 'fixationY';
-streamsMerged{plFixIdx}.info.desc.channels.channel{4}.eye = 'both';
-streamsMerged{plFixIdx}.info.desc.channels.channel{5}.label = 'azimuthDeg';
-streamsMerged{plFixIdx}.info.desc.channels.channel{5}.eye = 'both';
-streamsMerged{plFixIdx}.info.desc.channels.channel{6}.label = 'elevationDeg';
-streamsMerged{plFixIdx}.info.desc.channels.channel{6}.eye = 'both';
-
-% events:
-streamsMerged{plEventIdx}.time_stamps = plEventData.lsl_times';
-streamsMerged{plEventIdx}.time_series = horzcat(plEventData.name, plEventData.type)';
-
-streamsMerged{plEventIdx}.info.channel_count = '2';
-
-disp('--- replaced gaze data ---');
 
 
 %% xsens
@@ -398,7 +519,14 @@ xsensSegmIdx = cellfun(@(x) contains(x.info.name, 'LinearSegmentKinematicsDatagr
 xsensJointsIdx = cellfun(@(x) contains(x.info.name, 'JointAnglesDatagram1', 'IgnoreCase', true), streamsMerged);
 xsensEulerIdx = cellfun(@(x) contains(x.info.name, 'EulerDatagram1', 'IgnoreCase', true), streamsMerged);
 xsensQuatIdx = cellfun(@(x) contains(x.info.name, 'QuaternionDatagram1', 'IgnoreCase', true), streamsMerged);
-if ~isempty(xsensData)
+
+% Check XSens data and stream availability
+hasXSensData = ~isempty(xsensData);
+hasXSensCoMStream = any(xsensCoMIdx) && ~isempty(streams{xsensCoMIdx}.time_stamps);
+
+if hasXSensData && hasXSensCoMStream
+    fprintf('🔗 Processing XSens data integration\n');
+    
     xsensLSLTime = [];
     xsensCoMData = [];
     xsensSegmentData = [];
@@ -406,218 +534,334 @@ if ~isempty(xsensData)
     xsensEulerData = [];
     xsensQuatData = [];
     
-    % define vars
-    frameRate = xsensData.info{1}.MVN_version(2);
-    comData = xsensData.center_of_mass{1};
-    xsensTime = (0:(size(comData,1)-1)) * (1/frameRate) + streams{xsensCoMIdx}.time_stamps(1);
+    try
+        % define vars
+        frameRate = xsensData.info{1}.MVN_version(2);
+        comData = xsensData.center_of_mass{1};
+        
+        % Check if streams have sufficient data for cross-correlation
+        if length(streams{xsensCoMIdx}.time_stamps) < 2
+            fprintf('⚠️  Insufficient XSens LSL data for alignment - using raw timestamps\n');
+            xsensTime = (0:(size(comData,1)-1)) * (1/frameRate);
+        else
+            xsensTime = (0:(size(comData,1)-1)) * (1/frameRate) + streams{xsensCoMIdx}.time_stamps(1);
 
-    % resample existing LSL data to remove time gaps
-    lslCoMX = streams{xsensCoMIdx}.time_series(1,:);
-    newLSLTime = streams{xsensCoMIdx}.time_stamps(1):1/frameRate:streams{xsensCoMIdx}.time_stamps(end);
-    newCoMX = interp1(streams{xsensCoMIdx}.time_stamps, lslCoMX, newLSLTime);
+            % resample existing LSL data to remove time gaps
+            lslCoMX = streams{xsensCoMIdx}.time_series(1,:);
+            newLSLTime = streams{xsensCoMIdx}.time_stamps(1):1/frameRate:streams{xsensCoMIdx}.time_stamps(end);
+            
+            if length(newLSLTime) > 1
+                newCoMX = interp1(streams{xsensCoMIdx}.time_stamps, lslCoMX, newLSLTime, 'linear', 'extrap');
 
-    % use correlation to find offset between offline and LSL data
-    [r,lags] = xcorr(newCoMX, comData.CoM_pos_x);
-    [~,maxIdx] = max(r);
-    xsensTime = xsensTime + lags(maxIdx)*(1/frameRate);
+                % use correlation to find offset between offline and LSL data
+                if length(newCoMX) > 1 && length(comData.CoM_pos_x) > 1
+                    [r,lags] = xcorr(newCoMX, comData.CoM_pos_x);
+                    [~,maxIdx] = max(r);
+                    xsensTime = xsensTime + lags(maxIdx)*(1/frameRate);
+                    fprintf('✅ XSens alignment completed with cross-correlation\n');
+                else
+                    fprintf('⚠️  Insufficient data for cross-correlation - using raw timestamps\n');
+                end
+            else
+                fprintf('⚠️  Insufficient resampled data - using raw timestamps\n');
+            end
+        end
 
-    % identify new time array
-    idx = find(xsensTime >= newLSLTime(1) & xsensTime <= newLSLTime(end));
-    xsensLSLTime = [xsensLSLTime xsensTime(idx)];
+        % identify new time array
+        if exist('newLSLTime', 'var') && ~isempty(newLSLTime)
+            idx = find(xsensTime >= newLSLTime(1) & xsensTime <= newLSLTime(end));
+        else
+            % Use all available data if no LSL time reference
+            idx = 1:length(xsensTime);
+        end
+        
+        if ~isempty(idx)
+            xsensLSLTime = [xsensLSLTime xsensTime(idx)];
 
-    % copy center of mass data
-    for x = 2:size(xsensData.center_of_mass{1},2)
-        tmp = table2array(xsensData.center_of_mass{1});
-        tmp = tmp(:,x);
-        xsensCoMData = [xsensCoMData; tmp(idx,:)'];
+            % copy center of mass data
+            if isfield(xsensData, 'center_of_mass') && ~isempty(xsensData.center_of_mass{1})
+                for x = 2:size(xsensData.center_of_mass{1},2)
+                    tmp = table2array(xsensData.center_of_mass{1});
+                    tmp = tmp(:,x);
+                    xsensCoMData = [xsensCoMData; tmp(idx,:)'];
+                end
+                fprintf('✅ Processed %d center of mass channels\n', size(xsensData.center_of_mass{1},2)-1);
+            end
+
+            % copy segment positions
+            if isfield(xsensData, 'segment_position') && ~isempty(xsensData.segment_position{1})
+                for x = 2:size(xsensData.segment_position{1},2)
+                    tmp = table2array(xsensData.segment_position{1});
+                    tmp = tmp(:,x);
+                    xsensSegmentData = [xsensSegmentData; tmp(idx,:)'];
+                end
+                fprintf('✅ Processed %d segment position channels\n', size(xsensData.segment_position{1},2)-1);
+            end
+
+            % copy joint angles
+            if isfield(xsensData, 'joint_angles') && ~isempty(xsensData.joint_angles{1})
+                for x = 2:size(xsensData.joint_angles{1},2)
+                    tmp = table2array(xsensData.joint_angles{1});
+                    tmp = tmp(:,x);
+                    xsensJointData = [xsensJointData; tmp(idx,:)'];
+                end
+                fprintf('✅ Processed %d joint angle channels\n', size(xsensData.joint_angles{1},2)-1);
+            end
+
+            % copy euler orientation
+            if isfield(xsensData, 'segment_orientation_euler') && ~isempty(xsensData.segment_orientation_euler{1})
+                for x = 2:size(xsensData.segment_orientation_euler{1},2)
+                    tmp = table2array(xsensData.segment_orientation_euler{1});
+                    tmp = tmp(:,x);
+                    xsensEulerData = [xsensEulerData; tmp(idx,:)'];
+                end
+                fprintf('✅ Processed %d Euler orientation channels\n', size(xsensData.segment_orientation_euler{1},2)-1);
+            end
+
+            % copy quaternions
+            if isfield(xsensData, 'segment_orientation_quat') && ~isempty(xsensData.segment_orientation_quat{1})
+                for x = 1:size(xsensData.segment_orientation_quat{1},2)
+                    tmp = table2array(xsensData.segment_orientation_quat{1});
+                    tmp = tmp(:,x);
+                    xsensQuatData = [xsensQuatData; tmp(idx,:)'];
+                end
+                fprintf('✅ Processed %d quaternion channels\n', size(xsensData.segment_orientation_quat{1},2));
+            end
+        else
+            fprintf('⚠️  No overlapping time indices found between XSens and LSL data\n');
+        end
+
+        % write data to xdf streams (only if streams exist and data was processed)
+        if ~isempty(xsensCoMData) && any(xsensCoMIdx)
+            streamsMerged{xsensCoMIdx}.time_stamps = xsensLSLTime;
+            streamsMerged{xsensCoMIdx}.time_series = xsensCoMData;
+            streamsMerged{xsensCoMIdx}.info.desc.channels = {xsensData.center_of_mass{1}.Properties.VariableNames{2:end}};
+        end
+
+        % write segment positions to xdf streams
+        if ~isempty(xsensSegmentData) && any(xsensSegmIdx)
+            streamsMerged{xsensSegmIdx}.time_stamps = xsensLSLTime;
+            streamsMerged{xsensSegmIdx}.time_series = xsensSegmentData;
+            streamsMerged{xsensSegmIdx}.info.desc.channels = {xsensData.segment_position{1}.Properties.VariableNames{2:end}};
+        end
+
+        % write joint angles to xdf streams
+        if ~isempty(xsensJointData) && any(xsensJointsIdx)
+            streamsMerged{xsensJointsIdx}.time_stamps = xsensLSLTime;
+            streamsMerged{xsensJointsIdx}.time_series = xsensJointData;
+            streamsMerged{xsensJointsIdx}.info.desc.channels = {xsensData.joint_angles{1}.Properties.VariableNames{2:end}};
+        end
+
+        % write euler to xdf streams
+        if ~isempty(xsensEulerData) && any(xsensEulerIdx)
+            streamsMerged{xsensEulerIdx}.time_stamps = xsensLSLTime;
+            streamsMerged{xsensEulerIdx}.time_series = xsensEulerData;
+            streamsMerged{xsensEulerIdx}.info.desc.channels = {xsensData.segment_orientation_euler{1}.Properties.VariableNames{2:end}};
+        end
+
+        % write quaternions to xdf streams
+        if ~isempty(xsensQuatData) && any(xsensQuatIdx)
+            streamsMerged{xsensQuatIdx}.time_stamps = xsensLSLTime;
+            streamsMerged{xsensQuatIdx}.time_series = xsensQuatData;
+            streamsMerged{xsensQuatIdx}.info.desc.channels = {xsensData.segment_orientation_quat{1}.Properties.VariableNames{2:end}};
+        end
+        
+        disp('--- XSens processing complete ---');
+        
+    catch ME
+        fprintf('⚠️  XSens data processing failed: %s\n', ME.message);
+        disp('--- XSens processing failed, continuing without XSens data ---');
     end
-
-    % copy segment positions
-    for x = 2:size(xsensData.segment_position{1},2)
-        tmp = table2array(xsensData.segment_position{1});
-        tmp = tmp(:,x);
-        xsensSegmentData = [xsensSegmentData; tmp(idx,:)'];
+else
+    if ~hasXSensData
+        fprintf('ℹ️  No XSens data available - skipping XSens integration\n');
+    elseif ~hasXSensCoMStream
+        fprintf('ℹ️  No XSens LSL stream available - skipping XSens integration\n');
     end
-
-     % copy joint angles
-    for x = 2:size(xsensData.joint_angles{1},2)
-        tmp = table2array(xsensData.joint_angles{1});
-        tmp = tmp(:,x);
-        xsensJointData = [xsensJointData; tmp(idx,:)'];
-    end
-
-     % copy euler orientation
-    for x = 2:size(xsensData.segment_orientation_euler{1},2)
-        tmp = table2array(xsensData.segment_orientation_euler{1});
-        tmp = tmp(:,x);
-        xsensEulerData = [xsensEulerData; tmp(idx,:)'];
-    end
-
-     % copy quaternions
-    for x = 1:size(xsensData.segment_orientation_quat{1},2)
-        tmp = table2array(xsensData.segment_orientation_quat{1});
-        tmp = tmp(:,x);
-        xsensQuatData = [xsensQuatData; tmp(idx,:)'];
-    end
-
-    % write com to xdf streams
-    streamsMerged{xsensCoMIdx}.time_stamps = xsensLSLTime;
-    streamsMerged{xsensCoMIdx}.time_series = xsensCoMData;
-    streamsMerged{xsensCoMIdx}.info.desc.channels = {xsensData.center_of_mass{1}.Properties.VariableNames{2:end}};
-
-    % write segment positions to xdf streams
-    streamsMerged{xsensSegmIdx}.time_stamps = xsensLSLTime;
-    streamsMerged{xsensSegmIdx}.time_series = xsensSegmentData;
-    streamsMerged{xsensSegmIdx}.info.desc.channels = {xsensData.segment_position{1}.Properties.VariableNames{2:end}};
-
-    % write joint angles to xdf streams
-    streamsMerged{xsensJointsIdx}.time_stamps = xsensLSLTime;
-    streamsMerged{xsensJointsIdx}.time_series = xsensJointData;
-    streamsMerged{xsensJointsIdx}.info.desc.channels = {xsensData.joint_angles{1}.Properties.VariableNames{2:end}};
-
-    % write euler to xdf streams
-    streamsMerged{xsensEulerIdx}.time_stamps = xsensLSLTime;
-    streamsMerged{xsensEulerIdx}.time_series = xsensEulerData;
-    streamsMerged{xsensEulerIdx}.info.desc.channels = {xsensData.segment_orientation_euler{1}.Properties.VariableNames{2:end}};
-
-    % write quaternions to xdf streams
-    streamsMerged{xsensQuatIdx}.time_stamps = xsensLSLTime;
-    streamsMerged{xsensQuatIdx}.time_series = xsensQuatData;
-    streamsMerged{xsensQuatIdx}.info.desc.channels = {xsensData.segment_orientation_quat{1}.Properties.VariableNames{2:end}};
-    
-    disp('--- replaced Xsens data ---');
 end
 
 
 %% add lsl data to eeg struct
 
+fprintf('🔗 Integrating LSL streams into EEG structure\n');
+
 % match counter values in eeg and lsl data
 [~, idxAmp, idxLSL] = intersect(amp.data(end,:), streams{eegIdx}.time_series);
 counterLSLTime = streams{eegIdx}.time_stamps(idxLSL);
+
+fprintf('✅ Found %d matching counter values for synchronization\n', length(idxAmp));
 
 newChannelIdx = amp.nbchan+1;
 
 % sample all lsl data at the times of the counter values before adding
 
 % add ecg
-ampECG = interp1(streamsMerged{farosECGIdx}.time_stamps, streamsMerged{farosECGIdx}.time_series, counterLSLTime, 'cubic');
-amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-amp.data(newChannelIdx,idxAmp) = ampECG;
-amp.chanlocs(newChannelIdx).labels = 'Faros ECG';
-amp.chanlocs(newChannelIdx).type = 'ECG';
-newChannelIdx = newChannelIdx + 1;
-disp('--- merged ECG into EEG ---');
+if any(farosECGIdx) && ~isempty(streamsMerged{farosECGIdx}.time_stamps) && ~isempty(streamsMerged{farosECGIdx}.time_series)
+    try
+        ampECG = interp1(streamsMerged{farosECGIdx}.time_stamps, streamsMerged{farosECGIdx}.time_series, counterLSLTime, 'cubic');
+        amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+        amp.data(newChannelIdx,idxAmp) = ampECG;
+        amp.chanlocs(newChannelIdx).labels = 'Faros ECG';
+        amp.chanlocs(newChannelIdx).type = 'ECG';
+        newChannelIdx = newChannelIdx + 1;
+        fprintf('✅ Merged ECG into EEG structure\n');
+    catch ME
+        fprintf('⚠️  Failed to merge ECG data: %s\n', ME.message);
+    end
+else
+    fprintf('ℹ️  No ECG data available for merging\n');
+end
 
 % add photo
 % photoIdx = contains(streamNames, 'Photo', 'IgnoreCase', true);
 photoIdx = cellfun(@(x) contains(x.info.name, 'Photo', 'IgnoreCase', true), streamsMerged);
-ampPhoto = interp1(streamsMerged{photoIdx}.time_stamps, double(streamsMerged{photoIdx}.time_series), counterLSLTime, 'pchip');
-amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-amp.data(newChannelIdx, idxAmp) = ampPhoto;
-amp.chanlocs(newChannelIdx).labels = 'PhotoSensor';
-newChannelIdx = newChannelIdx + 1;
-disp('--- merged photo sensor into EEG ---');
+if any(photoIdx) && ~isempty(streamsMerged{photoIdx}.time_stamps) && ~isempty(streamsMerged{photoIdx}.time_series)
+    try
+        ampPhoto = interp1(streamsMerged{photoIdx}.time_stamps, double(streamsMerged{photoIdx}.time_series), counterLSLTime, 'pchip');
+        amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+        amp.data(newChannelIdx, idxAmp) = ampPhoto;
+        amp.chanlocs(newChannelIdx).labels = 'PhotoSensor';
+        amp.chanlocs(newChannelIdx).type = 'Photo';
+        newChannelIdx = newChannelIdx + 1;
+        fprintf('✅ Merged PhotoSensor into EEG structure\n');
+    catch ME
+        fprintf('⚠️  Failed to merge PhotoSensor data: %s\n', ME.message);
+    end
+else
+    fprintf('ℹ️  No PhotoSensor data available for merging\n');
+end
 
 % add gaze
-ampGazeX = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(1,:), counterLSLTime, 'pchip');
-ampGazeY = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(2,:), counterLSLTime, 'pchip');
-ampFixID = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(3,:), counterLSLTime, 'nearest');
-ampBlinkID = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(4,:), counterLSLTime, 'nearest');
-amp.data(newChannelIdx:newChannelIdx+3,:) = NaN(4, size(amp.data, 2));
-amp.data(newChannelIdx:newChannelIdx+3,idxAmp) = [ampGazeX; ampGazeY; ampFixID; ampBlinkID];
-for c = 0:3
-    amp.chanlocs(newChannelIdx+c).type = 'Gaze';
+if any(plGazeIdx) && ~isempty(streamsMerged{plGazeIdx}.time_stamps) && ~isempty(streamsMerged{plGazeIdx}.time_series)
+    try
+        % Check that we have enough channels in the gaze data
+        if size(streamsMerged{plGazeIdx}.time_series, 1) >= 4
+            ampGazeX = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(1,:), counterLSLTime, 'pchip');
+            ampGazeY = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(2,:), counterLSLTime, 'pchip');
+            ampFixID = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(3,:), counterLSLTime, 'nearest');
+            ampBlinkID = interp1(streamsMerged{plGazeIdx}.time_stamps, streamsMerged{plGazeIdx}.time_series(4,:), counterLSLTime, 'nearest');
+            amp.data(newChannelIdx:newChannelIdx+3,:) = NaN(4, size(amp.data, 2));
+            amp.data(newChannelIdx:newChannelIdx+3,idxAmp) = [ampGazeX; ampGazeY; ampFixID; ampBlinkID];
+            for c = 0:3
+                amp.chanlocs(newChannelIdx+c).type = 'Gaze';
+            end
+            amp.chanlocs(newChannelIdx).labels = 'GazeX';
+            amp.chanlocs(newChannelIdx+1).labels = 'GazeY';
+            amp.chanlocs(newChannelIdx+2).labels = 'FixationID';
+            amp.chanlocs(newChannelIdx+3).labels = 'BlinkID';
+            newChannelIdx = newChannelIdx + 4;
+            fprintf('✅ Merged gaze data into EEG structure (4 channels)\n');
+        else
+            fprintf('⚠️  Insufficient gaze channels (%d < 4) - skipping gaze integration\n', size(streamsMerged{plGazeIdx}.time_series, 1));
+        end
+    catch ME
+        fprintf('⚠️  Failed to merge gaze data: %s\n', ME.message);
+    end
+else
+    fprintf('ℹ️  No gaze data available for merging\n');
 end
-amp.chanlocs(newChannelIdx).labels = 'GazeX';
-amp.chanlocs(newChannelIdx+1).labels = 'GazeY';
-amp.chanlocs(newChannelIdx+2).labels = 'FixationID';
-amp.chanlocs(newChannelIdx+3).labels = 'BlinkID';
-newChannelIdx = newChannelIdx + 4;
-disp('--- merged gaze data into EEG ---');
 
 %% add xsens
-if ~isempty(xsensData)
-    % Center of mass (keep existing)
-    for m = 1:size(streamsMerged{xsensCoMIdx}.time_series,1)
-        ampCoM = interp1(streamsMerged{xsensCoMIdx}.time_stamps, streamsMerged{xsensCoMIdx}.time_series(m,:), counterLSLTime, 'pchip');
-        amp.data(newChannelIdx+m-1,:) = NaN(1, size(amp.data, 2));
-        amp.data(newChannelIdx+m-1, idxAmp) = ampCoM; % Fixed: was ampPhoto
-        amp.chanlocs(newChannelIdx+m-1).labels = char(streamsMerged{xsensCoMIdx}.info.desc.channels(m));
-        amp.chanlocs(newChannelIdx+m-1).type = 'Xsens';
-    end
-    newChannelIdx = newChannelIdx + size(streamsMerged{xsensCoMIdx}.time_series,1);
-    
-    % Critical gait joints - Ankle dorsiflexion/plantarflexion (MOST IMPORTANT)
-    ankleChannels = {'Right_Ankle_Dorsiflexion_Plantarflexion', 'Left_Ankle_Dorsiflexion_Plantarflexion'};
-    for ac = 1:length(ankleChannels)
-        ankleIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, ankleChannels{ac}, 'IgnoreCase', true);
-        if any(ankleIdx)
-            ampAnkleData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(ankleIdx,:), counterLSLTime, 'pchip');
-            amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-            amp.data(newChannelIdx, idxAmp) = ampAnkleData;
-            amp.chanlocs(newChannelIdx).labels = ankleChannels{ac};
-            amp.chanlocs(newChannelIdx).type = 'Xsens_Ankle';
-            newChannelIdx = newChannelIdx + 1;
+if ~isempty(xsensData) && any(xsensCoMIdx) && ~isempty(streamsMerged{xsensCoMIdx}.time_stamps)
+    try
+        fprintf('🔗 Integrating XSens data into EEG structure\n');
+        
+        % Center of mass (keep existing)
+        for m = 1:size(streamsMerged{xsensCoMIdx}.time_series,1)
+            ampCoM = interp1(streamsMerged{xsensCoMIdx}.time_stamps, streamsMerged{xsensCoMIdx}.time_series(m,:), counterLSLTime, 'pchip');
+            amp.data(newChannelIdx+m-1,:) = NaN(1, size(amp.data, 2));
+            amp.data(newChannelIdx+m-1, idxAmp) = ampCoM; % Fixed: was ampPhoto
+            amp.chanlocs(newChannelIdx+m-1).labels = char(streamsMerged{xsensCoMIdx}.info.desc.channels(m));
+            amp.chanlocs(newChannelIdx+m-1).type = 'Xsens';
         end
-    end
-    
-    % Hip flexion/extension (important for swing/stance detection)
-    hipChannels = {'Right_Hip_Flexion_Extension', 'Left_Hip_Flexion_Extension'};
-    for hc = 1:length(hipChannels)
-        hipIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, hipChannels{hc}, 'IgnoreCase', true);
-        if any(hipIdx)
-            ampHipData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(hipIdx,:), counterLSLTime, 'pchip');
-            amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-            amp.data(newChannelIdx, idxAmp) = ampHipData;
-            amp.chanlocs(newChannelIdx).labels = hipChannels{hc};
-            amp.chanlocs(newChannelIdx).type = 'Xsens_Hip';
-            newChannelIdx = newChannelIdx + 1;
+        newChannelIdx = newChannelIdx + size(streamsMerged{xsensCoMIdx}.time_series,1);
+        
+        fprintf('✅ Added %d XSens CoM channels to EEG\n', size(streamsMerged{xsensCoMIdx}.time_series,1));
+        
+        % Critical gait joints - only if joint data is available
+        if any(xsensJointsIdx) && ~isempty(streamsMerged{xsensJointsIdx}.time_stamps)
+            % Ankle dorsiflexion/plantarflexion (MOST IMPORTANT)
+            ankleChannels = {'Right_Ankle_Dorsiflexion_Plantarflexion', 'Left_Ankle_Dorsiflexion_Plantarflexion'};
+            for ac = 1:length(ankleChannels)
+                ankleIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, ankleChannels{ac}, 'IgnoreCase', true);
+                if any(ankleIdx)
+                    ampAnkleData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(ankleIdx,:), counterLSLTime, 'pchip');
+                    amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+                    amp.data(newChannelIdx, idxAmp) = ampAnkleData;
+                    amp.chanlocs(newChannelIdx).labels = ankleChannels{ac};
+                    amp.chanlocs(newChannelIdx).type = 'Xsens_Ankle';
+                    newChannelIdx = newChannelIdx + 1;
+                end
+            end
+            
+            % Hip flexion/extension (important for swing/stance detection)
+            hipChannels = {'Right_Hip_Flexion_Extension', 'Left_Hip_Flexion_Extension'};
+            for hc = 1:length(hipChannels)
+                hipIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, hipChannels{hc}, 'IgnoreCase', true);
+                if any(hipIdx)
+                    ampHipData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(hipIdx,:), counterLSLTime, 'pchip');
+                    amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+                    amp.data(newChannelIdx, idxAmp) = ampHipData;
+                    amp.chanlocs(newChannelIdx).labels = hipChannels{hc};
+                    amp.chanlocs(newChannelIdx).type = 'Xsens_Hip';
+                    newChannelIdx = newChannelIdx + 1;
+                end
+            end
+            
+            % Knee flexion/extension (important for gait cycle)
+            kneeChannels = {'Right_Knee_Flexion_Extension', 'Left_Knee_Flexion_Extension'};
+            for kc = 1:length(kneeChannels)
+                kneeIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, kneeChannels{kc}, 'IgnoreCase', true);
+                if any(kneeIdx)
+                    ampKneeData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(kneeIdx,:), counterLSLTime, 'pchip');
+                    amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+                    amp.data(newChannelIdx, idxAmp) = ampKneeData;
+                    amp.chanlocs(newChannelIdx).labels = kneeChannels{kc};
+                    amp.chanlocs(newChannelIdx).type = 'Xsens_Knee';
+                    newChannelIdx = newChannelIdx + 1;
+                end
+            end
+            
+            % Ball of foot (toe) flexion/extension (important for toe-off detection)
+            toeChannels = {'Right_Ball_Foot_Flexion_Extension', 'Left_Ball_Foot_Flexion_Extension'};
+            for tc = 1:length(toeChannels)
+                toeIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, toeChannels{tc}, 'IgnoreCase', true);
+                if any(toeIdx)
+                    ampToeData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(toeIdx,:), counterLSLTime, 'pchip');
+                    amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+                    amp.data(newChannelIdx, idxAmp) = ampToeData;
+                    amp.chanlocs(newChannelIdx).labels = toeChannels{tc};
+                    amp.chanlocs(newChannelIdx).type = 'Xsens_Toe';
+                    newChannelIdx = newChannelIdx + 1;
+                end
+            end
+            fprintf('✅ Added XSens joint angle channels for gait analysis\n');
         end
-    end
-    
-    % Knee flexion/extension (important for gait cycle)
-    kneeChannels = {'Right_Knee_Flexion_Extension', 'Left_Knee_Flexion_Extension'};
-    for kc = 1:length(kneeChannels)
-        kneeIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, kneeChannels{kc}, 'IgnoreCase', true);
-        if any(kneeIdx)
-            ampKneeData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(kneeIdx,:), counterLSLTime, 'pchip');
-            amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-            amp.data(newChannelIdx, idxAmp) = ampKneeData;
-            amp.chanlocs(newChannelIdx).labels = kneeChannels{kc};
-            amp.chanlocs(newChannelIdx).type = 'Xsens_Knee';
-            newChannelIdx = newChannelIdx + 1;
+        
+        % Foot positions - only if segment data is available
+        if any(xsensSegmIdx) && ~isempty(streamsMerged{xsensSegmIdx}.time_stamps)
+            footChannels = {'Left_Foot_Z', 'Right_Foot_Z'}; % Z for vertical movement
+            for fc = 1:length(footChannels)
+                footIdx = contains(streamsMerged{xsensSegmIdx}.info.desc.channels, footChannels{fc}, 'IgnoreCase', true);
+                if any(footIdx)
+                    ampFootData = interp1(streamsMerged{xsensSegmIdx}.time_stamps, streamsMerged{xsensSegmIdx}.time_series(footIdx,:), counterLSLTime, 'pchip');
+                    amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
+                    amp.data(newChannelIdx, idxAmp) = ampFootData;
+                    amp.chanlocs(newChannelIdx).labels = footChannels{fc};
+                    amp.chanlocs(newChannelIdx).type = 'Xsens_Foot_Pos';
+                    newChannelIdx = newChannelIdx + 1;
+                end
+            end
+            fprintf('✅ Added XSens foot position channels for gait analysis\n');
         end
+        
+        disp('--- XSens integration into EEG complete ---');
+        
+    catch ME
+        fprintf('⚠️  XSens EEG integration failed: %s\n', ME.message);
     end
-    
-    % Ball of foot (toe) flexion/extension (important for toe-off detection)
-    toeChannels = {'Right_Ball_Foot_Flexion_Extension', 'Left_Ball_Foot_Flexion_Extension'};
-    for tc = 1:length(toeChannels)
-        toeIdx = contains(streamsMerged{xsensJointsIdx}.info.desc.channels, toeChannels{tc}, 'IgnoreCase', true);
-        if any(toeIdx)
-            ampToeData = interp1(streamsMerged{xsensJointsIdx}.time_stamps, streamsMerged{xsensJointsIdx}.time_series(toeIdx,:), counterLSLTime, 'pchip');
-            amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-            amp.data(newChannelIdx, idxAmp) = ampToeData;
-            amp.chanlocs(newChannelIdx).labels = toeChannels{tc};
-            amp.chanlocs(newChannelIdx).type = 'Xsens_Toe';
-            newChannelIdx = newChannelIdx + 1;
-        end
-    end
-    
-    % Foot positions (if available from segment positions)
-    footChannels = {'Left_Foot_Z', 'Right_Foot_Z'}; % Z for vertical movement
-    for fc = 1:length(footChannels)
-        footIdx = contains(streamsMerged{xsensSegmIdx}.info.desc.channels, footChannels{fc}, 'IgnoreCase', true);
-        if any(footIdx)
-            ampFootData = interp1(streamsMerged{xsensSegmIdx}.time_stamps, streamsMerged{xsensSegmIdx}.time_series(footIdx,:), counterLSLTime, 'pchip');
-            amp.data(newChannelIdx,:) = NaN(1, size(amp.data, 2));
-            amp.data(newChannelIdx, idxAmp) = ampFootData;
-            amp.chanlocs(newChannelIdx).labels = footChannels{fc};
-            amp.chanlocs(newChannelIdx).type = 'Xsens_Foot_Pos';
-            newChannelIdx = newChannelIdx + 1;
-        end
-    end
-    
-    disp('--- merged essential gait analysis data into EEG ---');
+else
+    fprintf('ℹ️  No XSens data available for EEG integration\n');
 end
 
 
@@ -1128,24 +1372,80 @@ else
 end
 
 %% After all data is merged and before returning, detect gait events
-% Fast gait event detection
-% if ~isempty(xsensData)
-%     gaitEvents = detect_gait_events_advanced(streamsMerged, amp, true);
-% 
-%     % Add to EEG
-%     if ~isempty(gaitEvents)
-%         if isfield(eegMerged, 'event')
-%             lastEventIdx = length(eegMerged.event);
-%             for e = 1:length(gaitEvents)
-%                 eegMerged.event(lastEventIdx + e) = gaitEvents(e);
-%             end
-%         else
-%             eegMerged.event = gaitEvents;
-%         end
-%     end
-% end
+% Gait event detection using optimized algorithm
+if ~isempty(xsensData)
+    try
+        fprintf('🚶 Detecting gait events from XSens foot data...\n');
+        [heelStrikes, toeOffs, metrics] = gait_detection_final(amp, 'left', 'Verbose', true);
+        
+        % Convert gait events to EEGLAB event structure
+        if ~isempty(heelStrikes) || ~isempty(toeOffs)
+            newEvents = [];
+            eventCount = 0;
+            
+            % Add heel strike events
+            for i = 1:length(heelStrikes)
+                eventCount = eventCount + 1;
+                newEvents(eventCount).latency = round(heelStrikes(i) * amp.srate) + 1; % Convert to sample index
+                newEvents(eventCount).duration = 0;
+                newEvents(eventCount).type = 'heel_strike';
+                newEvents(eventCount).source = 'xsens_gait_detection';
+                newEvents(eventCount).pupil_type = '';
+                newEvents(eventCount).pupil_timestamp_ns = NaN;
+                newEvents(eventCount).pupil_timestamp_xdf = NaN;
+                newEvents(eventCount).pupil_recording_id = '';
+                newEvents(eventCount).blink_duration_ms = NaN;
+                %newEvents(eventCount).urevent = eventCount;
+            end
+            
+            % Add toe-off events
+            for i = 1:length(toeOffs)
+                eventCount = eventCount + 1;
+                newEvents(eventCount).latency = round(toeOffs(i) * amp.srate) + 1; % Convert to sample index
+                newEvents(eventCount).duration = 0;
+                newEvents(eventCount).type = 'toe_off';
+                newEvents(eventCount).source = 'xsens_gait_detection';
+                newEvents(eventCount).pupil_type = '';
+                newEvents(eventCount).pupil_timestamp_ns = NaN;
+                newEvents(eventCount).pupil_timestamp_xdf = NaN;
+                newEvents(eventCount).pupil_recording_id = '';
+                newEvents(eventCount).blink_duration_ms = NaN;
+                %newEvents(eventCount).urevent = eventCount;
+            end
+            
+            % Merge with existing events
+            if isfield(amp, 'event') && ~isempty(amp.event)
+                originalEventCount = length(amp.event);
+                for i = 1:length(newEvents)
+                    %newEvents(i).urevent = originalEventCount + i;
+                end
+                amp.event = [amp.event, newEvents];
+            else
+                amp.event = newEvents;
+            end
+            
+            fprintf('✅ Added %d gait events to EEG structure (%d heel strikes, %d toe-offs)\n', ...
+                    eventCount, length(heelStrikes), length(toeOffs));
+            
+            % Store gait metrics in EEG structure for later analysis
+            if ~isempty(fieldnames(metrics))
+                amp.etc.gait_metrics = metrics;
+                fprintf('📊 Gait metrics stored in EEG.etc.gait_metrics\n');
+            end
+        else
+            fprintf('⚠️  No gait events detected\n');
+        end
+        
+    catch ME
+        fprintf('❌ Gait detection failed: %s\n', ME.message);
+    end
+end
 
 %% Create comprehensive merging success visualizations
+% re-order events
+amp = eeg_checkset(amp,'eventconsistency');
+
+% create merging metrics
 fprintf('📊 Creating merging success visualizations...\n');
 
 try
@@ -1353,7 +1653,7 @@ try
     title('Synchronization Summary');
     axis off;
     
-    % Subplot 8: Missing data overview
+    % Subplot 8: Data availability and gait detection overview
     subplot(3, 3, 8);
     
     % Check for missing data streams
@@ -1365,16 +1665,53 @@ try
     dataStatus = {'EEG', 'XSens', 'Pupil', 'ECG'};
     dataAvailable = [hasEEG, hasXSens, hasPupil, hasECG];
     
-    colors = {'green', 'red'};
-    statusText = {'✓ Available', '✗ Missing'};
+    colors = {'red', 'green'}; % red for missing, green for available
+    statusText = {'✗ Missing', '✓ Available'}; % order matches boolean indexing
     
+    % Data availability status (top half)
     for i = 1:length(dataStatus)
-        colorIdx = 2 - dataAvailable(i); % Convert to 1-based indexing for colors
-        text(0.1, 0.9 - (i-1)*0.15, sprintf('%s: %s', dataStatus{i}, statusText{dataAvailable(i)+1}), ...
-             'Units', 'normalized', 'Color', colors{colorIdx}, 'FontSize', 12, 'FontWeight', 'bold');
+        colorIdx = dataAvailable(i) + 1; % 1 for missing (red), 2 for available (green)
+        statusIdx = dataAvailable(i) + 1; % 1 for missing, 2 for available
+        text(0.1, 0.95 - (i-1)*0.12, sprintf('%s: %s', dataStatus{i}, statusText{statusIdx}), ...
+             'Units', 'normalized', 'Color', colors{colorIdx}, 'FontSize', 10, 'FontWeight', 'bold');
     end
     
-    title('Data Availability Check');
+    % Gait detection status (bottom half)
+    text(0.1, 0.42, 'Gait Detection:', 'Units', 'normalized', 'FontSize', 11, 'FontWeight', 'bold');
+    
+    % Check for gait events in amp.event
+    gaitEventsDetected = false;
+    nHeelStrikes = 0;
+    nToeOffs = 0;
+    if isfield(amp, 'event') && ~isempty(amp.event)
+        % Count gait events by type
+        if isfield(amp.event, 'type')
+            nHeelStrikes = sum(strcmp({amp.event.type}, 'heel_strike'));
+            nToeOffs = sum(strcmp({amp.event.type}, 'toe_off'));
+            gaitEventsDetected = (nHeelStrikes > 0) || (nToeOffs > 0);
+        end
+    end
+    
+    if hasXSens && gaitEventsDetected
+        text(0.1, 0.32, sprintf('✓ %d heel strikes', nHeelStrikes), ...
+             'Units', 'normalized', 'Color', 'green', 'FontSize', 9);
+        text(0.1, 0.24, sprintf('✓ %d toe-offs', nToeOffs), ...
+             'Units', 'normalized', 'Color', 'green', 'FontSize', 9);
+             
+        % Add gait metrics if available
+        if isfield(amp, 'etc') && isfield(amp.etc, 'gait_metrics') && isfield(amp.etc.gait_metrics, 'cadence')
+            text(0.1, 0.16, sprintf('Cadence: %.1f steps/min', amp.etc.gait_metrics.cadence), ...
+                 'Units', 'normalized', 'Color', 'blue', 'FontSize', 9);
+        end
+    elseif hasXSens && ~gaitEventsDetected
+        text(0.1, 0.32, '⚠ XSens available, no gait events', ...
+             'Units', 'normalized', 'Color', [1 0.6 0], 'FontSize', 9); % Orange as RGB
+    else
+        text(0.1, 0.32, '✗ No XSens data for gait detection', ...
+             'Units', 'normalized', 'Color', 'red', 'FontSize', 9);
+    end
+    
+    title('Data Availability & Gait Detection');
     axis off;
     
     % Subplot 9: Processing summary
@@ -1402,7 +1739,7 @@ try
     sgtitle(sprintf('WaS4 Data Integration Summary - %s', subjectFolder), 'FontSize', 16, 'FontWeight', 'bold');
     
     % Save the figure
-    figPath = fullfile(dataPath, subjectFolder, sprintf('%s_merge_summary.png', subjectFolder));
+    figPath = fullfile(outPath, sprintf('%s_merge_summary.png', subjectFolder));
     saveas(fig, figPath);
     fprintf('   ✅ Saved visualization: %s\n', figPath);
     
@@ -1499,4 +1836,79 @@ opts = setvaropts(opts, ["sectionId", "recordingId"], "EmptyFieldRule", "auto");
 
 % Import the data
 fixations = readtable(filename, opts);
+end
+
+%% Time alignment function for Pupil Labs data
+function success = create_time_aligned_gaze(pupil_folder_path)
+% CREATE_TIME_ALIGNED_GAZE Create time_aligned_gaze.csv from gaze.csv and time_alignment_parameters.json
+%
+% This function performs the same time alignment as the Python script:
+% 1. Load gaze.csv and time_alignment_parameters.json
+% 2. Convert timestamps from nanoseconds to seconds
+% 3. Apply linear mapping using intercept and slope from alignment JSON
+% 4. Save the result as time_aligned_gaze.csv
+
+success = false;
+
+try
+    % File paths
+    gaze_file = fullfile(pupil_folder_path, 'gaze.csv');
+    params_file = fullfile(pupil_folder_path, 'time_alignment_parameters.json');
+    output_file = fullfile(pupil_folder_path, 'time_aligned_gaze.csv');
+    
+    % Check if required files exist
+    if ~exist(gaze_file, 'file')
+        fprintf('❌ gaze.csv not found in %s\n', pupil_folder_path);
+        return;
+    end
+    
+    if ~exist(params_file, 'file')
+        fprintf('❌ time_alignment_parameters.json not found in %s\n', pupil_folder_path);
+        return;
+    end
+    
+    fprintf('🔗 Creating time-aligned gaze data from %s\n', pupil_folder_path);
+    
+    % Load gaze data
+    fprintf('   Loading gaze.csv...\n');
+    gaze_data = readtable(gaze_file);
+    
+    % Convert nanoseconds to seconds (same as Python: * 1e-9)
+    if ismember('timestamp__ns_', gaze_data.Properties.VariableNames)
+        timestamp_col = 'timestamp__ns_';
+    elseif ismember('timestamp [ns]', gaze_data.Properties.VariableNames)
+        timestamp_col = 'timestamp [ns]';
+    else
+        fprintf('❌ Could not find timestamp column in gaze.csv\n');
+        return;
+    end
+    
+    gaze_data.timestamp_s = gaze_data.(timestamp_col) * 1e-9;
+    
+    % Load alignment parameters
+    fprintf('   Loading time_alignment_parameters.json...\n');
+    json_text = fileread(params_file);
+    params = jsondecode(json_text);
+    
+    % Apply linear mapping: lsl_time = intercept + timestamp_s * slope
+    % This matches the Python code: perform_linear_mapping(cloud_gaze_data["timestamp [s]"], parameter_dict["cloud_to_lsl"])
+    intercept = params.cloud_to_lsl.intercept;
+    slope = params.cloud_to_lsl.slope;
+    
+    gaze_data.lsl_time_s = intercept + gaze_data.timestamp_s * slope;
+    
+    fprintf('   Applied linear mapping: intercept=%.6f, slope=%.6f\n', intercept, slope);
+    
+    % Save the time-aligned data
+    fprintf('   Saving time_aligned_gaze.csv...\n');
+    writetable(gaze_data, output_file);
+    
+    fprintf('✅ Successfully created %s\n', output_file);
+    success = true;
+    
+catch ME
+    fprintf('❌ Time alignment failed: %s\n', ME.message);
+    success = false;
+end
+
 end

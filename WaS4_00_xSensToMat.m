@@ -21,7 +21,7 @@ dataPath = '/Volumes/ergo/rohdaten/RohDaten_GRAIL/WaS4/DATA/';  % Main data dire
 % Processing options
 processAllSubjects = true;  % Set to false to process specific subjects
 specificSubjects = [];     % Only used if processAllSubjects = false
-overwriteExisting = true;   % Set to true to reprocess existing .mat files
+overwriteExisting = false;   % Set to true to reprocess existing .mat files
 
 % Xsens file configuration
 % Xsens file configuration
